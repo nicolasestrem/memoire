@@ -216,6 +216,111 @@ pub fn get_latest_video_chunk(conn: &Connection) -> Result<Option<VideoChunk>> {
     }
 }
 
+/// Get paginated video chunks with optional filters
+pub fn get_chunks_paginated(
+    conn: &Connection,
+    limit: i64,
+    offset: i64,
+    monitor: Option<&str>,
+    start_date: Option<DateTime<Utc>>,
+    end_date: Option<DateTime<Utc>>,
+) -> Result<Vec<ChunkWithFrameCount>> {
+    let mut query = String::from(
+        r#"SELECT vc.id, vc.file_path, vc.device_name, vc.created_at,
+           COUNT(f.id) as frame_count
+           FROM video_chunks vc
+           LEFT JOIN frames f ON vc.id = f.video_chunk_id"#,
+    );
+
+    let mut conditions = Vec::new();
+    let mut params: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
+
+    if let Some(mon) = monitor {
+        conditions.push("vc.device_name = ?");
+        params.push(Box::new(mon.to_string()));
+    }
+
+    if let Some(start) = start_date {
+        conditions.push("vc.created_at >= ?");
+        params.push(Box::new(start.to_rfc3339()));
+    }
+
+    if let Some(end) = end_date {
+        conditions.push("vc.created_at <= ?");
+        params.push(Box::new(end.to_rfc3339()));
+    }
+
+    if !conditions.is_empty() {
+        query.push_str(" WHERE ");
+        query.push_str(&conditions.join(" AND "));
+    }
+
+    query.push_str(" GROUP BY vc.id ORDER BY vc.created_at DESC LIMIT ? OFFSET ?");
+
+    let mut stmt = conn.prepare(&query)?;
+
+    // Build params slice for query
+    let mut all_params: Vec<&dyn rusqlite::ToSql> = params.iter().map(|p| p.as_ref()).collect();
+    all_params.push(&limit);
+    all_params.push(&offset);
+
+    let chunks = stmt
+        .query_map(all_params.as_slice(), |row| {
+            Ok(ChunkWithFrameCount {
+                id: row.get(0)?,
+                file_path: row.get(1)?,
+                device_name: row.get(2)?,
+                created_at: parse_datetime(row, 3)?,
+                frame_count: row.get(4)?,
+            })
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+
+    Ok(chunks)
+}
+
+/// Get frame count for a specific video chunk
+pub fn get_frame_count_by_chunk(conn: &Connection, chunk_id: i64) -> Result<i64> {
+    let count: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM frames WHERE video_chunk_id = ?1",
+        params![chunk_id],
+        |row| row.get(0),
+    )?;
+    Ok(count)
+}
+
+/// Get statistics summary for each monitor
+pub fn get_monitors_summary(conn: &Connection) -> Result<Vec<MonitorSummary>> {
+    let mut stmt = conn.prepare(
+        r#"SELECT vc.device_name,
+           COUNT(DISTINCT vc.id) as total_chunks,
+           COUNT(f.id) as total_frames,
+           MAX(vc.created_at) as latest_capture
+           FROM video_chunks vc
+           LEFT JOIN frames f ON vc.id = f.video_chunk_id
+           GROUP BY vc.device_name
+           ORDER BY vc.device_name"#,
+    )?;
+
+    let summaries = stmt
+        .query_map([], |row| {
+            let latest: Option<String> = row.get(3)?;
+            Ok(MonitorSummary {
+                device_name: row.get(0)?,
+                total_chunks: row.get(1)?,
+                total_frames: row.get(2)?,
+                latest_capture: latest.and_then(|s| {
+                    DateTime::parse_from_rfc3339(&s)
+                        .map(|dt| dt.with_timezone(&Utc))
+                        .ok()
+                }),
+            })
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+
+    Ok(summaries)
+}
+
 // Helper functions
 
 fn row_to_frame(row: &Row) -> rusqlite::Result<Frame> {

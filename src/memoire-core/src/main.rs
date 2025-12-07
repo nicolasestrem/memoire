@@ -75,6 +75,17 @@ enum Commands {
 
     /// Check dependencies (FFmpeg, etc.)
     Check,
+
+    /// Start validation viewer web interface
+    Viewer {
+        /// Data directory for videos and database
+        #[arg(short, long)]
+        data_dir: Option<PathBuf>,
+
+        /// Web server port
+        #[arg(short, long, default_value = "8080")]
+        port: u16,
+    },
 }
 
 fn main() -> Result<()> {
@@ -103,6 +114,9 @@ fn main() -> Result<()> {
         }
         Commands::Check => {
             cmd_check()?;
+        }
+        Commands::Viewer { data_dir, port } => {
+            cmd_viewer(data_dir, port)?;
         }
     }
 
@@ -269,6 +283,38 @@ fn cmd_check() -> Result<()> {
     } else {
         println!("all checks passed!");
     }
+
+    Ok(())
+}
+
+#[tokio::main]
+async fn cmd_viewer(data_dir: Option<PathBuf>, port: u16) -> Result<()> {
+    // Resolve data directory
+    let data_dir = data_dir.unwrap_or_else(|| {
+        dirs::data_local_dir()
+            .unwrap_or_else(|| PathBuf::from("."))
+            .join("Memoire")
+    });
+
+    let db_path = data_dir.join("memoire.db");
+
+    if !db_path.exists() {
+        error!("database not found at {:?}", db_path);
+        error!("please run 'memoire record' first to initialize the database");
+        return Err(anyhow::anyhow!("database not found"));
+    }
+
+    info!("starting memoire validation viewer");
+    info!("data directory: {:?}", data_dir);
+    info!("database: {:?}", db_path);
+    info!("web interface: http://localhost:{}", port);
+
+    // Open database connection
+    let db = memoire_db::Database::open(&db_path)?;
+    let connection = db.into_connection();
+
+    // Start web server
+    memoire_web::serve(connection, data_dir, port).await?;
 
     Ok(())
 }

@@ -5,6 +5,7 @@ members = [
     "src/memoire-processing",
     "src/memoire-db",
     "src/memoire-core",
+    "src/memoire-web",
 ]
 
 [workspace.package]
@@ -12,7 +13,7 @@ version = "0.1.0"
 edition = "2021"
 authors = ["Memoire Contributors"]
 license = "MIT"
-repository = "https://github.com/user/memoire"
+repository = "https://github.com/nicolasestrem/memoire"
 
 [workspace.dependencies]
 # Async runtime
@@ -69,3 +70,11 @@ chrono = { version = "0.4", features = ["serde"] }
 
 # FFmpeg bindings
 ffmpeg-next = "7.0"
+
+# Web framework
+axum = { version = "0.7", features = ["macros"] }
+tower = "0.4"
+tower-http = { version = "0.5", features = ["fs", "cors", "trace"] }
+hyper = { version = "1.0", features = ["full"] }
+http-body-util = "0.1"
+bytes = "1.5"

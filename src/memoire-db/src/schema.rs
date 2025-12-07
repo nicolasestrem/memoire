@@ -84,3 +84,22 @@ pub struct NewOcrText {
     pub text_json: Option<String>,
     pub confidence: Option<f64>,
 }
+
+/// Video chunk with frame count (for validation viewer)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChunkWithFrameCount {
+    pub id: i64,
+    pub file_path: String,
+    pub device_name: String,
+    pub created_at: DateTime<Utc>,
+    pub frame_count: i64,
+}
+
+/// Monitor statistics summary
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MonitorSummary {
+    pub device_name: String,
+    pub total_chunks: i64,
+    pub total_frames: i64,
+    pub latest_capture: Option<DateTime<Utc>>,
+}

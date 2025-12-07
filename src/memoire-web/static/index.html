@@ -1,0 +1,105 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Memoire Validation Viewer</title>
+    <link rel="stylesheet" href="/style.css">
+</head>
+<body>
+    <header>
+        <h1>Memoire Validation Viewer</h1>
+        <div class="status" id="status">
+            <span class="status-indicator" id="status-indicator">●</span>
+            <span id="status-text">Ready</span>
+        </div>
+    </header>
+
+    <main>
+        <section class="filters">
+            <label>
+                Monitor:
+                <select id="monitor-select">
+                    <option value="">All Monitors</option>
+                </select>
+            </label>
+            <label>
+                Date:
+                <input type="date" id="date-filter">
+            </label>
+        </section>
+
+        <section class="chunk-browser">
+            <h2>Video Chunks</h2>
+            <div id="chunk-list" class="chunk-list"></div>
+            <button id="load-more" class="btn">Load More</button>
+        </section>
+
+        <section class="video-player">
+            <h2>Video Player</h2>
+            <video id="player" controls></video>
+            <div class="seek-controls">
+                <div class="seek-group">
+                    <label>
+                        Frame ID:
+                        <input type="number" id="frame-id" placeholder="Enter frame ID">
+                    </label>
+                    <button id="seek-frame" class="btn btn-small">Go</button>
+                </div>
+                <div class="seek-group">
+                    <label>
+                        Timestamp:
+                        <input type="datetime-local" id="timestamp" step="0.001">
+                    </label>
+                    <button id="seek-timestamp" class="btn btn-small">Go</button>
+                </div>
+            </div>
+        </section>
+
+        <section class="metadata">
+            <h2>Frame Metadata</h2>
+            <dl id="metadata-list" class="metadata-list">
+                <dt>Frame ID:</dt>
+                <dd id="meta-frame-id">-</dd>
+
+                <dt>Timestamp:</dt>
+                <dd id="meta-timestamp">-</dd>
+
+                <dt>Offset Index:</dt>
+                <dd id="meta-offset">-</dd>
+
+                <dt>Video Chunk:</dt>
+                <dd id="meta-chunk">-</dd>
+
+                <dt>Monitor:</dt>
+                <dd id="meta-monitor">-</dd>
+
+                <dt>App:</dt>
+                <dd id="meta-app">-</dd>
+
+                <dt>Window:</dt>
+                <dd id="meta-window">-</dd>
+
+                <dt>URL:</dt>
+                <dd id="meta-url">-</dd>
+
+                <dt>Focused:</dt>
+                <dd id="meta-focused">-</dd>
+            </dl>
+            <div class="nav-buttons">
+                <button id="prev-frame" class="btn">◄ Prev Frame</button>
+                <button id="next-frame" class="btn">Next Frame ►</button>
+            </div>
+        </section>
+
+        <section class="validation">
+            <h2>Validation Checks</h2>
+            <ul id="validation-results" class="validation-list">
+                <li class="pending">⏳ Waiting for video playback...</li>
+            </ul>
+        </section>
+    </main>
+
+    <script src="/app.js"></script>
+</body>
+</html>

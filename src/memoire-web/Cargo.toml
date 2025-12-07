@@ -1,0 +1,40 @@
+[package]
+name = "memoire-web"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+# Workspace crates
+memoire-db = { path = "../memoire-db" }
+
+# Web framework
+axum = { workspace = true }
+tower = { workspace = true }
+tower-http = { workspace = true }
+hyper = { workspace = true }
+tokio = { workspace = true }
+
+# Serialization
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+# Error handling
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+
+# Logging
+tracing = { workspace = true }
+
+# Time
+chrono = { workspace = true }
+
+# Database
+rusqlite = { workspace = true }
+
+# HTTP utilities
+http-body-util = { workspace = true }
+bytes = { workspace = true }
+tokio-util = { version = "0.7", features = ["io"] }

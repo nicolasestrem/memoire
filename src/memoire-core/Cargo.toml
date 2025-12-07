@@ -31,3 +31,4 @@ tao.workspace = true
 memoire-capture = { path = "../memoire-capture" }
 memoire-processing = { path = "../memoire-processing" }
 memoire-db = { path = "../memoire-db" }
+memoire-web = { path = "../memoire-web" }
