@@ -67,6 +67,11 @@ impl Database {
         &mut self.conn
     }
 
+    /// Consume the database and return the underlying connection
+    pub fn into_connection(self) -> Connection {
+        self.conn
+    }
+
     /// Run all pending migrations
     fn run_migrations(&mut self) -> Result<()> {
         migrations::run_all(&self.conn)?;
