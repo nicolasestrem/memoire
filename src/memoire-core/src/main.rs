@@ -422,7 +422,7 @@ fn cmd_search(query: String, data_dir: Option<PathBuf>, limit: i64) -> Result<()
     let db = memoire_db::Database::open(&db_path)?;
 
     // Perform search
-    let results = memoire_db::search_ocr(db.connection(), &query, limit)?;
+    let results = memoire_db::search_ocr(db.connection(), &query, limit, 0)?;
 
     if results.is_empty() {
         println!("no results found for query: '{}'", query);
@@ -431,23 +431,27 @@ fn cmd_search(query: String, data_dir: Option<PathBuf>, limit: i64) -> Result<()
 
     println!("found {} result(s):\n", results.len());
 
-    for (i, result) in results.iter().enumerate() {
-        println!("{}. Frame ID: {}", i + 1, result.frame_id);
-        println!("   Timestamp: {}", result.timestamp);
-        println!("   Device: {}", result.device_name);
-        
+    for (i, (ocr, frame)) in results.iter().enumerate() {
+        println!("{}. Frame ID: {}", i + 1, frame.id);
+        println!("   Timestamp: {}", frame.timestamp);
+
+        // Get video chunk for device name
+        if let Ok(Some(chunk)) = memoire_db::get_video_chunk(db.connection(), frame.video_chunk_id) {
+            println!("   Device: {}", chunk.device_name);
+        }
+
         // Show snippet of text (first 150 chars)
-        let snippet = if result.ocr_text.len() > 150 {
-            format!("{}...", &result.ocr_text[..150])
+        let snippet = if ocr.text.len() > 150 {
+            format!("{}...", &ocr.text[..150])
         } else {
-            result.ocr_text.clone()
+            ocr.text.clone()
         };
         println!("   Text: {}", snippet.replace('\n', " "));
-        
-        if let Some(conf) = result.confidence {
+
+        if let Some(conf) = ocr.confidence {
             println!("   Confidence: {:.2}%", conf * 100.0);
         }
-        
+
         println!();
     }
 

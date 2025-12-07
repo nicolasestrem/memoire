@@ -212,70 +212,82 @@ impl Indexer {
         Ok(result)
     }
 
-    /// Extract a specific frame from video using FFmpeg
+    /// Extract a specific frame from video using FFmpeg command-line tool
     fn extract_frame_from_video(&self, video_path: &PathBuf, frame_index: i64) -> Result<FrameData> {
-        use ffmpeg_next as ffmpeg;
+        use std::process::{Command, Stdio};
+        use std::io::Read;
 
-        // Open input file
-        let mut ictx = ffmpeg::format::input(video_path)?;
+        // Use ffmpeg to extract a specific frame as raw RGBA data
+        // -i input.mp4 -vf "select=eq(n\,FRAME_INDEX)" -vframes 1 -f rawvideo -pix_fmt rgba -
 
-        // Find video stream
-        let input = ictx
-            .streams()
-            .best(ffmpeg::media::Type::Video)
-            .ok_or_else(|| anyhow::anyhow!("no video stream found"))?;
-        let stream_index = input.index();
+        let frame_filter = format!("select=eq(n\\,{})", frame_index);
 
-        // Create decoder
-        let context_decoder = ffmpeg::codec::context::Context::from_parameters(input.parameters())?;
-        let mut decoder = context_decoder.decoder().video()?;
+        let mut child = Command::new("ffmpeg")
+            .arg("-i")
+            .arg(video_path)
+            .arg("-vf")
+            .arg(&frame_filter)
+            .arg("-vframes")
+            .arg("1")
+            .arg("-f")
+            .arg("rawvideo")
+            .arg("-pix_fmt")
+            .arg("rgba")
+            .arg("-")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .map_err(|e| anyhow::anyhow!("failed to spawn ffmpeg: {}", e))?;
 
-        let mut current_frame = 0i64;
-        let mut target_frame_data: Option<FrameData> = None;
+        // Read frame data from stdout
+        let mut frame_data = Vec::new();
+        child.stdout.as_mut()
+            .ok_or_else(|| anyhow::anyhow!("failed to capture stdout"))?
+            .read_to_end(&mut frame_data)?;
 
-        // Read packets until we find the target frame
-        for (stream, packet) in ictx.packets() {
-            if stream.index() == stream_index {
-                decoder.send_packet(&packet)?;
-
-                let mut decoded = ffmpeg::util::frame::Video::empty();
-                while decoder.receive_frame(&mut decoded).is_ok() {
-                    if current_frame == frame_index {
-                        // Convert to RGBA
-                        let mut scaler = ffmpeg::software::scaling::context::Context::get(
-                            decoder.format(),
-                            decoder.width(),
-                            decoder.height(),
-                            ffmpeg::format::Pixel::RGBA,
-                            decoder.width(),
-                            decoder.height(),
-                            ffmpeg::software::scaling::Flags::BILINEAR,
-                        )?;
-
-                        let mut rgba_frame = ffmpeg::util::frame::Video::empty();
-                        scaler.run(&decoded, &mut rgba_frame)?;
-
-                        // Copy data
-                        let data = rgba_frame.data(0).to_vec();
-                        target_frame_data = Some(FrameData {
-                            width: rgba_frame.width(),
-                            height: rgba_frame.height(),
-                            data,
-                        });
-                        break;
-                    }
-                    current_frame += 1;
-                }
-
-                if target_frame_data.is_some() {
-                    break;
-                }
-            }
+        let status = child.wait()?;
+        if !status.success() {
+            return Err(anyhow::anyhow!("ffmpeg failed with exit code {:?}", status.code()));
         }
 
-        decoder.send_eof()?;
+        // Get video dimensions using ffprobe
+        let probe_output = Command::new("ffprobe")
+            .arg("-v")
+            .arg("error")
+            .arg("-select_streams")
+            .arg("v:0")
+            .arg("-show_entries")
+            .arg("stream=width,height")
+            .arg("-of")
+            .arg("csv=p=0")
+            .arg(video_path)
+            .output()
+            .map_err(|e| anyhow::anyhow!("failed to run ffprobe: {}", e))?;
 
-        target_frame_data.ok_or_else(|| anyhow::anyhow!("frame {} not found in video", frame_index))
+        let dimensions = String::from_utf8_lossy(&probe_output.stdout);
+        let parts: Vec<&str> = dimensions.trim().split(',').collect();
+        if parts.len() != 2 {
+            return Err(anyhow::anyhow!("invalid ffprobe output: {}", dimensions));
+        }
+
+        let width: u32 = parts[0].parse()?;
+        let height: u32 = parts[1].parse()?;
+
+        // Validate frame data size
+        let expected_size = (width * height * 4) as usize;
+        if frame_data.len() != expected_size {
+            return Err(anyhow::anyhow!(
+                "unexpected frame data size: got {}, expected {}",
+                frame_data.len(),
+                expected_size
+            ));
+        }
+
+        Ok(FrameData {
+            width,
+            height,
+            data: frame_data,
+        })
     }
 
     /// Insert OCR results in a batch
@@ -289,13 +301,14 @@ impl Indexer {
         for (frame_id, result) in results {
             let text_json = serde_json::to_string(&result.lines)?;
 
-            memoire_db::insert_ocr_text(
-                self.db.connection(),
-                *frame_id,
-                &result.text,
-                Some(&text_json),
-                Some(result.confidence),
-            )?;
+            let new_ocr = memoire_db::NewOcrText {
+                frame_id: *frame_id,
+                text: result.text.clone(),
+                text_json: Some(text_json),
+                confidence: Some(result.confidence as f64),
+            };
+
+            memoire_db::insert_ocr_text(self.db.connection(), &new_ocr)?;
         }
 
         Ok(())

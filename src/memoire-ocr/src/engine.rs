@@ -1,6 +1,6 @@
 use crate::error::{OcrError, Result};
 use serde::{Deserialize, Serialize};
-use tracing::{debug, error, warn};
+use tracing::debug;
 use windows::{
     Foundation::IAsyncOperation,
     Graphics::Imaging::{BitmapPixelFormat, SoftwareBitmap},

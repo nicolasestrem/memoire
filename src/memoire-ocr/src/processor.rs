@@ -67,31 +67,9 @@ impl Processor {
             )));
         }
 
-        // Create SoftwareBitmap with BGRA8 format (Windows native)
-        let bitmap = SoftwareBitmap::Create(
-            BitmapPixelFormat::Bgra8,
-            frame.width as i32,
-            frame.height as i32,
-        ).map_err(|e| OcrError::ConversionError(format!("failed to create bitmap: {}", e)))?;
-
-        // Get bitmap buffer
-        let buffer = bitmap.LockBuffer(windows::Graphics::Imaging::BitmapBufferAccessMode::Write)
-            .map_err(|e| OcrError::ConversionError(format!("failed to lock buffer: {}", e)))?;
-
-        let plane = buffer.GetPlaneDescription(0)
-            .map_err(|e| OcrError::ConversionError(format!("failed to get plane: {}", e)))?;
-
-        // Get reference to buffer data
-        let buffer_ref = buffer.CreateReference()
-            .map_err(|e| OcrError::ConversionError(format!("failed to create buffer reference: {}", e)))?;
-
-        let data_buffer: windows::Storage::Streams::IBuffer = buffer_ref.cast()
-            .map_err(|e| OcrError::ConversionError(format!("failed to cast buffer: {}", e)))?;
-
-        // Copy RGBA data to BGRA format
+        // Convert RGBA to BGRA format
         // Windows expects BGRA, our input is RGBA, so we need to swap R and B channels
         let mut bgra_data = Vec::with_capacity(frame.data.len());
-
         for chunk in frame.data.chunks_exact(4) {
             bgra_data.push(chunk[2]); // B
             bgra_data.push(chunk[1]); // G
@@ -99,23 +77,54 @@ impl Processor {
             bgra_data.push(chunk[3]); // A
         }
 
-        // Write data to bitmap buffer using unsafe Windows API
-        unsafe {
-            let data_interface: windows::Storage::Streams::IBufferByteAccess = data_buffer.cast()
-                .map_err(|e| OcrError::ConversionError(format!("failed to get buffer access: {}", e)))?;
+        // Create SoftwareBitmap using image crate as intermediate
+        // This is a workaround for the lack of direct buffer access in windows-rs 0.58
+        use image::{ImageBuffer, Rgba};
 
-            let buffer_ptr = data_interface.Buffer()
-                .map_err(|e| OcrError::ConversionError(format!("failed to get buffer pointer: {}", e)))?;
+        // Create image from BGRA data
+        let img = ImageBuffer::<Rgba<u8>, Vec<u8>>::from_raw(
+            frame.width,
+            frame.height,
+            bgra_data,
+        ).ok_or_else(|| OcrError::ConversionError("failed to create image buffer".to_string()))?;
 
-            std::ptr::copy_nonoverlapping(
-                bgra_data.as_ptr(),
-                buffer_ptr,
-                bgra_data.len()
-            );
-        }
+        // Save to temporary in-memory PNG
+        let mut png_data = Vec::new();
+        img.write_to(
+            &mut std::io::Cursor::new(&mut png_data),
+            image::ImageFormat::Png
+        )?;
 
-        data_buffer.SetLength(bgra_data.len() as u32)
-            .map_err(|e| OcrError::ConversionError(format!("failed to set buffer length: {}", e)))?;
+        // Create SoftwareBitmap from PNG data using Windows BitmapDecoder
+        use windows::Storage::Streams::{DataWriter, InMemoryRandomAccessStream};
+        use windows::Graphics::Imaging::BitmapDecoder;
+
+        let stream = InMemoryRandomAccessStream::new()
+            .map_err(|e| OcrError::ConversionError(format!("failed to create stream: {}", e)))?;
+
+        let writer = DataWriter::CreateDataWriter(&stream)
+            .map_err(|e| OcrError::ConversionError(format!("failed to create writer: {}", e)))?;
+
+        writer.WriteBytes(&png_data)
+            .map_err(|e| OcrError::ConversionError(format!("failed to write bytes: {}", e)))?;
+
+        writer.StoreAsync()
+            .map_err(|e| OcrError::ConversionError(format!("failed to store: {}", e)))?
+            .get()
+            .map_err(|e| OcrError::ConversionError(format!("failed to get: {}", e)))?;
+
+        stream.Seek(0)
+            .map_err(|e| OcrError::ConversionError(format!("failed to seek: {}", e)))?;
+
+        let decoder = BitmapDecoder::CreateAsync(&stream)
+            .map_err(|e| OcrError::ConversionError(format!("failed to create decoder: {}", e)))?
+            .get()
+            .map_err(|e| OcrError::ConversionError(format!("failed to get decoder: {}", e)))?;
+
+        let bitmap = decoder.GetSoftwareBitmapAsync()
+            .map_err(|e| OcrError::ConversionError(format!("failed to get bitmap async: {}", e)))?
+            .get()
+            .map_err(|e| OcrError::ConversionError(format!("failed to get bitmap: {}", e)))?;
 
         debug!("converted RGBA frame to SoftwareBitmap");
         Ok(bitmap)
