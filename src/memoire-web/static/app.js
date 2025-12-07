@@ -23,6 +23,12 @@ const elements = {
     validationResults: document.getElementById('validation-results'),
     statusIndicator: document.getElementById('status-indicator'),
     statusText: document.getElementById('status-text'),
+    ocrText: document.getElementById('ocr-text'),
+    ocrProgress: document.getElementById('ocr-progress'),
+    ocrStatsText: document.getElementById('ocr-stats-text'),
+    searchInput: document.getElementById('search-input'),
+    searchBtn: document.getElementById('search-btn'),
+    searchResults: document.getElementById('search-results'),
 };
 
 // Initialize on page load
@@ -31,6 +37,7 @@ document.addEventListener('DOMContentLoaded', init);
 async function init() {
     setupEventListeners();
     await loadChunks();
+    startOcrStatsPolling();
     updateStatus('Ready', 'green');
 }
 
@@ -44,6 +51,14 @@ function setupEventListeners() {
     elements.player.addEventListener('timeupdate', handleTimeUpdate);
     elements.player.addEventListener('seeked', handleSeeked);
     elements.player.addEventListener('loadedmetadata', handleVideoLoaded);
+
+    // Search functionality
+    elements.searchBtn.addEventListener('click', handleSearch);
+    elements.searchInput.addEventListener('keypress', (e) => {
+        if (e.key === 'Enter') {
+            handleSearch();
+        }
+    });
 }
 
 // Load chunks from API
@@ -210,6 +225,34 @@ function displayFrameMetadata(frame) {
     document.getElementById('meta-window').textContent = frame.window_name || '-';
     document.getElementById('meta-url').textContent = frame.browser_url || '-';
     document.getElementById('meta-focused').textContent = frame.focused ? 'Yes' : 'No';
+
+    // Display OCR text
+    displayOcrText(frame);
+}
+
+async function displayOcrText(frame) {
+    const ocrContainer = elements.ocrText;
+
+    if (!frame.ocr_text || frame.ocr_text.length === 0) {
+        // Check if OCR is still processing
+        try {
+            const statsResponse = await fetch('/api/stats/ocr');
+            const stats = await statsResponse.json();
+
+            if (stats.processed < stats.total) {
+                ocrContainer.innerHTML = '<div class="ocr-processing">⏳ OCR processing in progress... Check back soon.</div>';
+            } else {
+                ocrContainer.innerHTML = '<div class="ocr-empty">No text detected in this frame</div>';
+            }
+        } catch (error) {
+            ocrContainer.innerHTML = '<div class="ocr-empty">No text detected in this frame</div>';
+        }
+        return;
+    }
+
+    // Display OCR text
+    const textContent = frame.ocr_text.map(ocr => ocr.text).join('\n\n');
+    ocrContainer.innerHTML = `<div>${escapeHtml(textContent)}</div>`;
 }
 
 async function validateSeekAccuracy() {
@@ -267,4 +310,126 @@ function getIcon(type) {
 function updateStatus(text, color) {
     elements.statusText.textContent = text;
     elements.statusIndicator.style.color = `var(--accent-${color})`;
+}
+
+// OCR Stats Polling
+let ocrStatsInterval = null;
+
+function startOcrStatsPolling() {
+    // Poll immediately
+    updateOcrStats();
+
+    // Then poll every 5 seconds
+    ocrStatsInterval = setInterval(updateOcrStats, 5000);
+}
+
+async function updateOcrStats() {
+    try {
+        const response = await fetch('/api/stats/ocr');
+        const stats = await response.json();
+
+        const percentage = stats.total > 0 ? (stats.processed / stats.total) * 100 : 0;
+
+        elements.ocrProgress.style.width = `${percentage}%`;
+        elements.ocrStatsText.textContent = `${stats.processed} / ${stats.total} frames processed (${percentage.toFixed(1)}%)`;
+
+        // Stop polling if complete
+        if (stats.processed >= stats.total && stats.total > 0) {
+            clearInterval(ocrStatsInterval);
+            ocrStatsInterval = null;
+        }
+    } catch (error) {
+        console.error('Failed to fetch OCR stats:', error);
+        elements.ocrStatsText.textContent = 'Stats unavailable';
+    }
+}
+
+// Search Functionality
+async function handleSearch() {
+    const query = elements.searchInput.value.trim();
+
+    if (!query) {
+        elements.searchResults.innerHTML = '<div class="search-empty">Enter a search query to find text in OCR data</div>';
+        return;
+    }
+
+    try {
+        elements.searchResults.innerHTML = '<div class="search-loading">⏳ Searching...</div>';
+
+        const params = new URLSearchParams({ query });
+        const response = await fetch(`/api/search?${params}`);
+
+        if (!response.ok) {
+            throw new Error('Search failed');
+        }
+
+        const results = await response.json();
+
+        if (!results || results.length === 0) {
+            elements.searchResults.innerHTML = '<div class="search-empty">No results found for your query</div>';
+            return;
+        }
+
+        displaySearchResults(results);
+    } catch (error) {
+        console.error('Search error:', error);
+        elements.searchResults.innerHTML = '<div class="search-empty">Search failed. Please try again.</div>';
+    }
+}
+
+function displaySearchResults(results) {
+    const query = elements.searchInput.value.trim();
+
+    elements.searchResults.innerHTML = '';
+
+    results.forEach(result => {
+        const card = document.createElement('div');
+        card.className = 'search-result-card';
+        card.onclick = () => handleSearchResultClick(result.frame_id);
+
+        const timestamp = new Date(result.timestamp).toLocaleString();
+
+        // Highlight search terms in snippet
+        const highlightedSnippet = highlightText(result.text, query);
+
+        card.innerHTML = `
+            <div class="search-result-header">
+                <div class="search-result-timestamp">${timestamp}</div>
+                <div class="search-result-score">Score: ${result.score.toFixed(2)}</div>
+            </div>
+            <div class="search-result-snippet">${highlightedSnippet}</div>
+            <div class="search-result-meta">
+                Frame #${result.frame_id} - ${result.app_name || 'Unknown App'} - ${result.window_name || 'Unknown Window'}
+            </div>
+        `;
+
+        elements.searchResults.appendChild(card);
+    });
+}
+
+async function handleSearchResultClick(frameId) {
+    await seekToFrame(frameId);
+
+    // Scroll to video player
+    document.querySelector('.video-player').scrollIntoView({ behavior: 'smooth' });
+}
+
+function highlightText(text, query) {
+    const escapedText = escapeHtml(text);
+    const escapedQuery = escapeRegex(query);
+
+    // Create case-insensitive regex
+    const regex = new RegExp(`(${escapedQuery})`, 'gi');
+
+    return escapedText.replace(regex, '<mark>$1</mark>');
+}
+
+function escapeHtml(text) {
+    const div = document.createElement('div');
+    div.textContent = text;
+    return div.innerHTML;
+}
+
+function escapeRegex(str) {
+    return str.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }

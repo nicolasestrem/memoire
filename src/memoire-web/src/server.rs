@@ -30,7 +30,9 @@ pub async fn serve(
         .route("/api/frames", get(routes::get_frames))
         .route("/api/frames/:id", get(routes::get_frame))
         .route("/api/stats", get(routes::get_stats))
+        .route("/api/stats/ocr", get(routes::get_ocr_stats))
         .route("/api/monitors", get(routes::get_monitors))
+        .route("/api/search", get(routes::search_ocr))
         // Video streaming
         .route("/video/:id", get(routes::stream_video))
         // Static files (HTML/CSS/JS)

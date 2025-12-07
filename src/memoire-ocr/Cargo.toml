@@ -1,0 +1,21 @@
+[package]
+name = "memoire-ocr"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+windows = { version = "0.58", features = [
+    "Media_Ocr",
+    "Graphics_Imaging",
+    "Graphics_Imaging_BitmapEncoder",
+    "Storage_Streams",
+    "Foundation",
+    "Foundation_Collections"
+]}
+tokio = { version = "1.35", features = ["full"] }
+image = "0.25"
+anyhow = "1.0"
+thiserror = "1.0"
+tracing = "0.1"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"

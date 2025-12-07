@@ -6,6 +6,7 @@ members = [
     "src/memoire-db",
     "src/memoire-core",
     "src/memoire-web",
+    "src/memoire-ocr",
 ]
 
 [workspace.package]

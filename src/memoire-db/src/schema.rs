@@ -103,3 +103,27 @@ pub struct MonitorSummary {
     pub total_frames: i64,
     pub latest_capture: Option<DateTime<Utc>>,
 }
+
+/// Frame with optional OCR text (from LEFT JOIN)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FrameWithOcr {
+    pub id: i64,
+    pub video_chunk_id: i64,
+    pub offset_index: i64,
+    pub timestamp: DateTime<Utc>,
+    pub app_name: Option<String>,
+    pub window_name: Option<String>,
+    pub browser_url: Option<String>,
+    pub focused: bool,
+    pub ocr_text: Option<OcrText>,
+}
+
+/// OCR indexing statistics
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OcrStats {
+    pub total_frames: i64,
+    pub frames_with_ocr: i64,
+    pub pending_frames: i64,
+    pub processing_rate: i64,
+    pub last_updated: Option<DateTime<Utc>>,
+}

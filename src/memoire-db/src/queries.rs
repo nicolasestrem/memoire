@@ -188,6 +188,132 @@ pub fn search_ocr(
     Ok(results)
 }
 
+/// Get frames without OCR text (for batch processing)
+pub fn get_frames_without_ocr(conn: &Connection, limit: i64) -> Result<Vec<Frame>> {
+    let mut stmt = conn.prepare(
+        r#"SELECT f.id, f.video_chunk_id, f.offset_index, f.timestamp, f.app_name,
+           f.window_name, f.browser_url, f.focused
+           FROM frames f
+           LEFT JOIN ocr_text o ON f.id = o.frame_id
+           WHERE o.id IS NULL
+           ORDER BY f.timestamp ASC
+           LIMIT ?1"#,
+    )?;
+
+    let frames = stmt
+        .query_map(params![limit], row_to_frame)?
+        .collect::<Result<Vec<_>, _>>()?;
+
+    Ok(frames)
+}
+
+/// Get count of frames that have OCR text
+pub fn get_ocr_count(conn: &Connection) -> Result<i64> {
+    let count: i64 = conn.query_row(
+        "SELECT COUNT(DISTINCT frame_id) FROM ocr_text",
+        [],
+        |row| row.get(0),
+    )?;
+    Ok(count)
+}
+
+/// Get frame with OCR text (if available) using LEFT JOIN
+pub fn get_frame_with_ocr(conn: &Connection, frame_id: i64) -> Result<Option<FrameWithOcr>> {
+    let mut stmt = conn.prepare(
+        r#"SELECT f.id, f.video_chunk_id, f.offset_index, f.timestamp, f.app_name,
+           f.window_name, f.browser_url, f.focused,
+           o.id, o.frame_id, o.text, o.text_json, o.confidence
+           FROM frames f
+           LEFT JOIN ocr_text o ON f.id = o.frame_id
+           WHERE f.id = ?1"#,
+    )?;
+
+    let result = stmt.query_row(params![frame_id], |row| {
+        let ocr_text = if let Ok(ocr_id) = row.get::<_, i64>(8) {
+            Some(OcrText {
+                id: ocr_id,
+                frame_id: row.get(9)?,
+                text: row.get(10)?,
+                text_json: row.get(11)?,
+                confidence: row.get(12)?,
+            })
+        } else {
+            None
+        };
+
+        Ok(FrameWithOcr {
+            id: row.get(0)?,
+            video_chunk_id: row.get(1)?,
+            offset_index: row.get(2)?,
+            timestamp: parse_datetime(row, 3)?,
+            app_name: row.get(4)?,
+            window_name: row.get(5)?,
+            browser_url: row.get(6)?,
+            focused: row.get::<_, i32>(7)? != 0,
+            ocr_text,
+        })
+    });
+
+    match result {
+        Ok(frame) => Ok(Some(frame)),
+        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// Get frames with OCR text in time range
+pub fn get_frames_with_ocr_in_range(
+    conn: &Connection,
+    start: DateTime<Utc>,
+    end: DateTime<Utc>,
+    limit: i64,
+    offset: i64,
+) -> Result<Vec<FrameWithOcr>> {
+    let mut stmt = conn.prepare(
+        r#"SELECT f.id, f.video_chunk_id, f.offset_index, f.timestamp, f.app_name,
+           f.window_name, f.browser_url, f.focused,
+           o.id, o.frame_id, o.text, o.text_json, o.confidence
+           FROM frames f
+           LEFT JOIN ocr_text o ON f.id = o.frame_id
+           WHERE f.timestamp >= ?1 AND f.timestamp <= ?2
+           ORDER BY f.timestamp DESC
+           LIMIT ?3 OFFSET ?4"#,
+    )?;
+
+    let frames = stmt
+        .query_map(
+            params![start.to_rfc3339(), end.to_rfc3339(), limit, offset],
+            |row| {
+                let ocr_text = if let Ok(ocr_id) = row.get::<_, i64>(8) {
+                    Some(OcrText {
+                        id: ocr_id,
+                        frame_id: row.get(9)?,
+                        text: row.get(10)?,
+                        text_json: row.get(11)?,
+                        confidence: row.get(12)?,
+                    })
+                } else {
+                    None
+                };
+
+                Ok(FrameWithOcr {
+                    id: row.get(0)?,
+                    video_chunk_id: row.get(1)?,
+                    offset_index: row.get(2)?,
+                    timestamp: parse_datetime(row, 3)?,
+                    app_name: row.get(4)?,
+                    window_name: row.get(5)?,
+                    browser_url: row.get(6)?,
+                    focused: row.get::<_, i32>(7)? != 0,
+                    ocr_text,
+                })
+            },
+        )?
+        .collect::<Result<Vec<_>, _>>()?;
+
+    Ok(frames)
+}
+
 /// Get total frame count
 pub fn get_frame_count(conn: &Connection) -> Result<i64> {
     let count: i64 = conn.query_row("SELECT COUNT(*) FROM frames", [], |row| row.get(0))?;
@@ -358,6 +484,88 @@ pub fn get_monitors_summary(conn: &Connection) -> Result<Vec<MonitorSummary>> {
         .collect::<Result<Vec<_>, _>>()?;
 
     Ok(summaries)
+}
+
+/// Get OCR text for a specific frame
+pub fn get_ocr_text_by_frame(conn: &Connection, frame_id: i64) -> Result<Option<OcrText>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, frame_id, text, text_json, confidence FROM ocr_text WHERE frame_id = ?1",
+    )?;
+
+    let ocr = stmt.query_row(params![frame_id], |row| {
+        Ok(OcrText {
+            id: row.get(0)?,
+            frame_id: row.get(1)?,
+            text: row.get(2)?,
+            text_json: row.get(3)?,
+            confidence: row.get(4)?,
+        })
+    });
+
+    match ocr {
+        Ok(o) => Ok(Some(o)),
+        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// Get OCR statistics
+pub fn get_ocr_stats(conn: &Connection) -> Result<OcrStats> {
+    let total_frames: i64 = conn.query_row("SELECT COUNT(*) FROM frames", [], |row| row.get(0))?;
+
+    let frames_with_ocr: i64 = conn.query_row(
+        "SELECT COUNT(DISTINCT frame_id) FROM ocr_text",
+        [],
+        |row| row.get(0),
+    )?;
+
+    let pending_frames = total_frames - frames_with_ocr;
+
+    // Calculate processing rate (frames processed in last hour)
+    let processing_rate: i64 = conn.query_row(
+        r#"SELECT COUNT(DISTINCT o.frame_id)
+           FROM ocr_text o
+           JOIN frames f ON o.frame_id = f.id
+           WHERE f.timestamp >= datetime('now', '-1 hour')"#,
+        [],
+        |row| row.get(0),
+    )?;
+
+    // Get last updated timestamp
+    let last_updated: Option<DateTime<Utc>> = {
+        let result: Result<String, _> = conn.query_row(
+            "SELECT MAX(f.timestamp) FROM frames f JOIN ocr_text o ON f.id = o.frame_id",
+            [],
+            |row| row.get(0),
+        );
+
+        result.ok().and_then(|s| {
+            DateTime::parse_from_rfc3339(&s)
+                .map(|dt| dt.with_timezone(&Utc))
+                .ok()
+        })
+    };
+
+    Ok(OcrStats {
+        total_frames,
+        frames_with_ocr,
+        pending_frames,
+        processing_rate,
+        last_updated,
+    })
+}
+
+/// Get total count of search results
+pub fn get_search_count(conn: &Connection, query: &str) -> Result<i64> {
+    let count: i64 = conn.query_row(
+        r#"SELECT COUNT(*)
+           FROM ocr_text o
+           JOIN ocr_text_fts fts ON o.id = fts.rowid
+           WHERE ocr_text_fts MATCH ?1"#,
+        params![query],
+        |row| row.get(0),
+    )?;
+    Ok(count)
 }
 
 // Helper functions
