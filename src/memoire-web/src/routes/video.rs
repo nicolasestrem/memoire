@@ -11,6 +11,9 @@ use memoire_db;
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 
+/// Maximum chunk size for range requests (10 MB)
+const MAX_CHUNK_SIZE: usize = 10 * 1024 * 1024;
+
 /// Parse Range header
 fn parse_range_header(range: &str, file_size: u64) -> Option<(u64, u64)> {
     // Parse "bytes=start-end" format
@@ -42,7 +45,8 @@ pub async fn stream_video(
 ) -> Result<Response, ApiError> {
     // Get chunk from database
     let chunk = {
-        let db = state.db.lock().unwrap();
+        let db = state.db.lock()
+            .map_err(|_| ApiError::Internal(anyhow::anyhow!("database lock poisoned")))?;
         memoire_db::get_video_chunk(&db, chunk_id)?
             .ok_or_else(|| ApiError::NotFound(format!("chunk {} not found", chunk_id)))?
     };
@@ -69,13 +73,28 @@ pub async fn stream_video(
         let range_str = range_header.to_str().unwrap_or("");
 
         if let Some((start, end)) = parse_range_header(range_str, file_size) {
-            // Serve partial content
-            let mut file = File::open(&file_path)?;
-            file.seek(SeekFrom::Start(start))?;
-
             let chunk_size = (end - start + 1) as usize;
-            let mut buffer = vec![0u8; chunk_size];
-            file.read_exact(&mut buffer)?;
+
+            // Validate chunk size
+            if chunk_size > MAX_CHUNK_SIZE {
+                return Err(ApiError::BadRequest(format!(
+                    "range too large: {} bytes (max: {} bytes)",
+                    chunk_size, MAX_CHUNK_SIZE
+                )));
+            }
+
+            // Use spawn_blocking for sync file I/O to avoid blocking tokio runtime
+            let file_path_clone = file_path.clone();
+            let buffer = tokio::task::spawn_blocking(move || -> std::io::Result<Vec<u8>> {
+                let mut file = File::open(&file_path_clone)?;
+                file.seek(SeekFrom::Start(start))?;
+
+                let mut buffer = vec![0u8; chunk_size];
+                file.read_exact(&mut buffer)?;
+                Ok(buffer)
+            })
+            .await
+            .map_err(|e| ApiError::Internal(anyhow::anyhow!("task join error: {}", e)))??;
 
             let content_range = format!("bytes {}-{}/{}", start, end, file_size);
 

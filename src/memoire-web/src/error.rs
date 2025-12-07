@@ -22,6 +22,9 @@ pub enum ApiError {
     #[error("range not satisfiable")]
     RangeNotSatisfiable,
 
+    #[error("not implemented: {0}")]
+    NotImplemented(String),
+
     #[error("internal server error: {0}")]
     Internal(#[from] anyhow::Error),
 
@@ -42,6 +45,11 @@ impl IntoResponse for ApiError {
                 StatusCode::RANGE_NOT_SATISFIABLE,
                 "RangeNotSatisfiable",
                 "requested range not satisfiable".to_string(),
+            ),
+            ApiError::NotImplemented(msg) => (
+                StatusCode::NOT_IMPLEMENTED,
+                "NotImplemented",
+                msg,
             ),
             ApiError::Internal(err) => (
                 StatusCode::INTERNAL_SERVER_ERROR,

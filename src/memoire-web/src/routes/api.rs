@@ -53,10 +53,11 @@ pub async fn get_chunks(
     State(state): State<AppState>,
     Query(params): Query<ChunksQuery>,
 ) -> Result<Json<ChunksResponse>, ApiError> {
-    let db = state.db.lock().unwrap();
+    let db = state.db.lock()
+        .map_err(|_| ApiError::Internal(anyhow::anyhow!("database lock poisoned")))?;
 
-    let limit = params.limit.unwrap_or(50).min(100);
-    let offset = params.offset.unwrap_or(0);
+    let limit = params.limit.unwrap_or(50).max(1).min(100);
+    let offset = params.offset.unwrap_or(0).max(0);
 
     let chunks = memoire_db::get_chunks_paginated(
         &db,
@@ -68,7 +69,13 @@ pub async fn get_chunks(
     )
     .map_err(|e| ApiError::Database(e.to_string()))?;
 
-    let total = chunks.len() as i64;
+    let total = memoire_db::get_total_chunk_count(
+        &db,
+        params.monitor.as_deref(),
+        None, // start_date
+        None, // end_date
+    )
+    .map_err(|e| ApiError::Database(e.to_string()))?;
 
     let chunks_with_metadata = chunks
         .into_iter()
@@ -92,7 +99,8 @@ pub async fn get_chunk(
     State(state): State<AppState>,
     Path(id): Path<i64>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let db = state.db.lock().unwrap();
+    let db = state.db.lock()
+        .map_err(|_| ApiError::Internal(anyhow::anyhow!("database lock poisoned")))?;
 
     let chunk = memoire_db::get_video_chunk(&db, id)?
         .ok_or_else(|| ApiError::NotFound(format!("chunk {} not found", id)))?;
@@ -109,29 +117,25 @@ pub async fn get_chunk(
     })))
 }
 
-/// GET /api/chunks/:id/frames
+/// GET /api/chunks/:id/frames (stub)
 pub async fn get_chunk_frames(
     State(_state): State<AppState>,
     Path(_id): Path<i64>,
     Query(_params): Query<ChunksQuery>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    // TODO: Implement get_frames_by_chunk
-    Ok(Json(serde_json::json!({
-        "frames": [],
-        "total": 0,
-    })))
+    Err(ApiError::NotImplemented(
+        "GET /api/chunks/:id/frames endpoint not yet implemented".to_string()
+    ))
 }
 
-/// GET /api/frames
+/// GET /api/frames (stub)
 pub async fn get_frames(
     State(_state): State<AppState>,
     Query(_params): Query<FramesQuery>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    // TODO: Implement time range query
-    Ok(Json(serde_json::json!({
-        "frames": [],
-        "total": 0,
-    })))
+    Err(ApiError::NotImplemented(
+        "GET /api/frames endpoint not yet implemented".to_string()
+    ))
 }
 
 /// GET /api/frames/:id
@@ -139,7 +143,8 @@ pub async fn get_frame(
     State(state): State<AppState>,
     Path(id): Path<i64>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let db = state.db.lock().unwrap();
+    let db = state.db.lock()
+        .map_err(|_| ApiError::Internal(anyhow::anyhow!("database lock poisoned")))?;
 
     let frame = memoire_db::get_frame(&db, id)?
         .ok_or_else(|| ApiError::NotFound(format!("frame {} not found", id)))?;
@@ -167,7 +172,8 @@ pub async fn get_frame(
 pub async fn get_stats(
     State(state): State<AppState>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let db = state.db.lock().unwrap();
+    let db = state.db.lock()
+        .map_err(|_| ApiError::Internal(anyhow::anyhow!("database lock poisoned")))?;
 
     let total_frames = memoire_db::get_frame_count(&db)?;
     let monitors = memoire_db::get_monitors_summary(&db)
@@ -186,7 +192,8 @@ pub async fn get_stats(
 pub async fn get_monitors(
     State(state): State<AppState>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let db = state.db.lock().unwrap();
+    let db = state.db.lock()
+        .map_err(|_| ApiError::Internal(anyhow::anyhow!("database lock poisoned")))?;
 
     let monitors = memoire_db::get_monitors_summary(&db)
         .map_err(|e| ApiError::Database(e.to_string()))?;

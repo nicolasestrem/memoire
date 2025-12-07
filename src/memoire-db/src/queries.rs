@@ -289,6 +289,45 @@ pub fn get_frame_count_by_chunk(conn: &Connection, chunk_id: i64) -> Result<i64>
     Ok(count)
 }
 
+/// Get total chunk count with optional filters
+pub fn get_total_chunk_count(
+    conn: &Connection,
+    monitor: Option<&str>,
+    start_date: Option<DateTime<Utc>>,
+    end_date: Option<DateTime<Utc>>,
+) -> Result<i64> {
+    let mut query = String::from("SELECT COUNT(*) FROM video_chunks");
+
+    let mut conditions = Vec::new();
+    let mut params: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
+
+    if let Some(mon) = monitor {
+        conditions.push("device_name = ?");
+        params.push(Box::new(mon.to_string()));
+    }
+
+    if let Some(start) = start_date {
+        conditions.push("created_at >= ?");
+        params.push(Box::new(start.to_rfc3339()));
+    }
+
+    if let Some(end) = end_date {
+        conditions.push("created_at <= ?");
+        params.push(Box::new(end.to_rfc3339()));
+    }
+
+    if !conditions.is_empty() {
+        query.push_str(" WHERE ");
+        query.push_str(&conditions.join(" AND "));
+    }
+
+    let mut stmt = conn.prepare(&query)?;
+    let all_params: Vec<&dyn rusqlite::ToSql> = params.iter().map(|p| p.as_ref()).collect();
+
+    let count: i64 = stmt.query_row(all_params.as_slice(), |row| row.get(0))?;
+    Ok(count)
+}
+
 /// Get statistics summary for each monitor
 pub fn get_monitors_summary(conn: &Connection) -> Result<Vec<MonitorSummary>> {
     let mut stmt = conn.prepare(
