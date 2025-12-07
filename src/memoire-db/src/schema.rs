@@ -1,0 +1,86 @@
+//! Database schema types
+
+use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
+
+/// Video chunk metadata (5-minute MP4 segments)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VideoChunk {
+    pub id: i64,
+    pub file_path: String,
+    pub device_name: String,
+    pub created_at: DateTime<Utc>,
+}
+
+/// Frame metadata within a video chunk
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Frame {
+    pub id: i64,
+    pub video_chunk_id: i64,
+    pub offset_index: i64,
+    pub timestamp: DateTime<Utc>,
+    pub app_name: Option<String>,
+    pub window_name: Option<String>,
+    pub browser_url: Option<String>,
+    pub focused: bool,
+}
+
+/// OCR extracted text from a frame
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OcrText {
+    pub id: i64,
+    pub frame_id: i64,
+    pub text: String,
+    pub text_json: Option<String>, // Bounding boxes as JSON
+    pub confidence: Option<f64>,
+}
+
+/// Audio chunk metadata (30-second segments)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AudioChunk {
+    pub id: i64,
+    pub file_path: String,
+    pub device_name: Option<String>,
+    pub is_input_device: Option<bool>,
+    pub timestamp: DateTime<Utc>,
+}
+
+/// Audio transcription with timestamps
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AudioTranscription {
+    pub id: i64,
+    pub audio_chunk_id: i64,
+    pub transcription: String,
+    pub timestamp: DateTime<Utc>,
+    pub speaker_id: Option<i64>,
+    pub start_time: Option<f64>,
+    pub end_time: Option<f64>,
+}
+
+/// New video chunk to insert
+#[derive(Debug, Clone)]
+pub struct NewVideoChunk {
+    pub file_path: String,
+    pub device_name: String,
+}
+
+/// New frame to insert
+#[derive(Debug, Clone)]
+pub struct NewFrame {
+    pub video_chunk_id: i64,
+    pub offset_index: i64,
+    pub timestamp: DateTime<Utc>,
+    pub app_name: Option<String>,
+    pub window_name: Option<String>,
+    pub browser_url: Option<String>,
+    pub focused: bool,
+}
+
+/// New OCR text to insert
+#[derive(Debug, Clone)]
+pub struct NewOcrText {
+    pub frame_id: i64,
+    pub text: String,
+    pub text_json: Option<String>,
+    pub confidence: Option<f64>,
+}

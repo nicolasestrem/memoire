@@ -1,0 +1,71 @@
+[workspace]
+resolver = "2"
+members = [
+    "src/memoire-capture",
+    "src/memoire-processing",
+    "src/memoire-db",
+    "src/memoire-core",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+authors = ["Memoire Contributors"]
+license = "MIT"
+repository = "https://github.com/user/memoire"
+
+[workspace.dependencies]
+# Async runtime
+tokio = { version = "1.35", features = ["full"] }
+
+# Database
+rusqlite = { version = "0.31", features = ["bundled", "backup"] }
+
+# Windows APIs
+windows = { version = "0.58", features = [
+    "Win32_Graphics_Dxgi",
+    "Win32_Graphics_Dxgi_Common",
+    "Win32_Graphics_Direct3D11",
+    "Win32_Graphics_Direct3D",
+    "Win32_Graphics_Gdi",
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_System_Threading",
+    "Win32_UI_WindowsAndMessaging",
+    "Graphics_Imaging",
+    "Media_Ocr",
+]}
+
+# Audio
+cpal = "0.15"
+
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Error handling
+anyhow = "1.0"
+thiserror = "1.0"
+
+# CLI
+clap = { version = "4.4", features = ["derive"] }
+
+# IPC
+interprocess = "2.0"
+
+# System tray
+tray-icon = "0.19"
+tao = { version = "0.30", default-features = false, features = ["rwh_06"] }
+
+# Image processing
+image = "0.25"
+
+# Time
+chrono = { version = "0.4", features = ["serde"] }
+
+# FFmpeg bindings
+ffmpeg-next = "7.0"

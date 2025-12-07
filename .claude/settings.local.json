@@ -1,0 +1,15 @@
+{
+  "permissions": {
+    "allow": [
+      "Skill(superpowers:brainstorming)",
+      "mcp__MCP_DOCKER__firecrawl_scrape",
+      "Bash(dir:*)",
+      "Bash(git -C \"C:\\Users\\nicol\\Desktop\\Memoire\" status)",
+      "Bash(git -C \"C:\\Users\\nicol\\Desktop\\Memoire\" log --oneline -10)",
+      "Bash(tree:*)",
+      "mcp__MCP_DOCKER__firecrawl_search"
+    ],
+    "deny": [],
+    "ask": []
+  }
+}

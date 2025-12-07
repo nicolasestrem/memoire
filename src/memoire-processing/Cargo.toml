@@ -1,0 +1,17 @@
+[package]
+name = "memoire-processing"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+tokio.workspace = true
+windows.workspace = true
+tracing.workspace = true
+anyhow.workspace = true
+thiserror.workspace = true
+image.workspace = true
+chrono.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+
+memoire-db = { path = "../memoire-db" }

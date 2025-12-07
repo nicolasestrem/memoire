@@ -1,0 +1,46 @@
+# Rust
+target/
+Cargo.lock
+
+# .NET
+bin/
+obj/
+*.user
+*.suo
+.vs/
+
+# Node/React
+node_modules/
+dist/
+build/
+.next/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Memoire data (don't commit user data)
+*.db
+*.db-wal
+*.db-shm
+videos/
+audio/
+logs/
+
+# Environment
+.env
+.env.local
+*.local
+
+# Build artifacts
+*.exe
+*.dll
+*.pdb
+*.so
+*.dylib

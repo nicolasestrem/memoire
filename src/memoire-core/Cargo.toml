@@ -1,0 +1,33 @@
+[package]
+name = "memoire-core"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "memoire"
+path = "src/main.rs"
+
+[dependencies]
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+anyhow.workspace = true
+clap.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+chrono.workspace = true
+interprocess.workspace = true
+
+# Signal handling
+ctrlc = { version = "3.4", features = ["termination"] }
+
+# Platform directories
+dirs = "5.0"
+
+# System tray
+tray-icon.workspace = true
+tao.workspace = true
+
+memoire-capture = { path = "../memoire-capture" }
+memoire-processing = { path = "../memoire-processing" }
+memoire-db = { path = "../memoire-db" }
