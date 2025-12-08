@@ -5,7 +5,7 @@ use rusqlite::Connection;
 use tracing::info;
 
 /// Current schema version
-const SCHEMA_VERSION: i64 = 1;
+const SCHEMA_VERSION: i64 = 3;
 
 /// Run all pending migrations
 pub fn run_all(conn: &Connection) -> Result<()> {
@@ -16,6 +16,14 @@ pub fn run_all(conn: &Connection) -> Result<()> {
 
         if current_version < 1 {
             migrate_v1(conn)?;
+        }
+
+        if current_version < 2 {
+            migrate_v2(conn)?;
+        }
+
+        if current_version < 3 {
+            migrate_v3(conn)?;
         }
 
         set_schema_version(conn, SCHEMA_VERSION)?;
@@ -137,6 +145,34 @@ fn migrate_v1(conn: &Connection) -> Result<()> {
             INSERT INTO audio_fts(audio_fts, rowid, transcription) VALUES('delete', old.id, old.transcription);
             INSERT INTO audio_fts(rowid, transcription) VALUES (new.id, new.transcription);
         END;
+    "#)?;
+
+    Ok(())
+}
+
+/// Migration v2: Add video dimensions to video_chunks
+fn migrate_v2(conn: &Connection) -> Result<()> {
+    info!("applying migration v2: add video dimensions to video_chunks");
+
+    conn.execute_batch(r#"
+        -- Add width and height columns for video metadata caching
+        ALTER TABLE video_chunks ADD COLUMN width INTEGER;
+        ALTER TABLE video_chunks ADD COLUMN height INTEGER;
+    "#)?;
+
+    Ok(())
+}
+
+/// Migration v3: Add frame_hash column for deduplication
+fn migrate_v3(conn: &Connection) -> Result<()> {
+    info!("applying migration v3: add frame_hash for deduplication");
+
+    conn.execute_batch(r#"
+        -- Add perceptual hash column for frame deduplication
+        ALTER TABLE frames ADD COLUMN frame_hash INTEGER;
+
+        -- Index for efficient hash lookups within a video chunk
+        CREATE INDEX IF NOT EXISTS idx_frames_hash ON frames(video_chunk_id, frame_hash);
     "#)?;
 
     Ok(())

@@ -9,7 +9,6 @@ use axum::{
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use tower_http::cors::{CorsLayer, Any};
-use tower_http::services::ServeDir;
 use tower_http::trace::TraceLayer;
 use tracing::info;
 
@@ -35,8 +34,10 @@ pub async fn serve(
         .route("/api/search", get(routes::search_ocr))
         // Video streaming
         .route("/video/:id", get(routes::stream_video))
-        // Static files (HTML/CSS/JS)
-        .nest_service("/", ServeDir::new("src/memoire-web/static"))
+        // Static files (embedded at compile time)
+        .route("/", get(routes::serve_index))
+        .route("/style.css", get(routes::serve_style))
+        .route("/app.js", get(routes::serve_app_js))
         // Add state
         .with_state(state)
         // Middleware

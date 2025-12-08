@@ -10,6 +10,8 @@ pub struct VideoChunk {
     pub file_path: String,
     pub device_name: String,
     pub created_at: DateTime<Utc>,
+    pub width: Option<u32>,
+    pub height: Option<u32>,
 }
 
 /// Frame metadata within a video chunk
@@ -23,6 +25,7 @@ pub struct Frame {
     pub window_name: Option<String>,
     pub browser_url: Option<String>,
     pub focused: bool,
+    pub frame_hash: Option<i64>,
 }
 
 /// OCR extracted text from a frame
@@ -62,6 +65,8 @@ pub struct AudioTranscription {
 pub struct NewVideoChunk {
     pub file_path: String,
     pub device_name: String,
+    pub width: Option<u32>,
+    pub height: Option<u32>,
 }
 
 /// New frame to insert
@@ -74,6 +79,7 @@ pub struct NewFrame {
     pub window_name: Option<String>,
     pub browser_url: Option<String>,
     pub focused: bool,
+    pub frame_hash: Option<i64>,
 }
 
 /// New OCR text to insert
@@ -93,6 +99,8 @@ pub struct ChunkWithFrameCount {
     pub device_name: String,
     pub created_at: DateTime<Utc>,
     pub frame_count: i64,
+    pub width: Option<u32>,
+    pub height: Option<u32>,
 }
 
 /// Monitor statistics summary
@@ -115,6 +123,7 @@ pub struct FrameWithOcr {
     pub window_name: Option<String>,
     pub browser_url: Option<String>,
     pub focused: bool,
+    pub frame_hash: Option<i64>,
     pub ocr_text: Option<OcrText>,
 }
 

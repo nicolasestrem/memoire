@@ -79,3 +79,6 @@ tower-http = { version = "0.5", features = ["fs", "cors", "trace"] }
 hyper = { version = "1.0", features = ["full"] }
 http-body-util = "0.1"
 bytes = "1.5"
+
+# Async utilities
+futures = "0.3"

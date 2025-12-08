@@ -98,6 +98,10 @@ enum Commands {
         /// OCR processing rate (frames per second)
         #[arg(long, default_value = "10")]
         ocr_fps: u32,
+
+        /// OCR language (BCP47 tag, e.g., "en-US", "fr-FR", "de-DE", "ja-JP")
+        #[arg(long)]
+        ocr_language: Option<String>,
     },
 
     /// Search OCR text
@@ -145,8 +149,8 @@ fn main() -> Result<()> {
         Commands::Viewer { data_dir, port } => {
             cmd_viewer(data_dir, port)?;
         }
-        Commands::Index { data_dir, ocr_fps } => {
-            cmd_index(data_dir, ocr_fps)?;
+        Commands::Index { data_dir, ocr_fps, ocr_language } => {
+            cmd_index(data_dir, ocr_fps, ocr_language)?;
         }
         Commands::Search { query, data_dir, limit } => {
             cmd_search(query, data_dir, limit)?;
@@ -361,7 +365,7 @@ async fn cmd_viewer(data_dir: Option<PathBuf>, port: u16) -> Result<()> {
 }
 
 #[tokio::main]
-async fn cmd_index(data_dir: Option<PathBuf>, ocr_fps: u32) -> Result<()> {
+async fn cmd_index(data_dir: Option<PathBuf>, ocr_fps: u32, ocr_language: Option<String>) -> Result<()> {
     // Resolve data directory
     let data_dir = data_dir.unwrap_or_else(|| {
         dirs::data_local_dir()
@@ -380,9 +384,14 @@ async fn cmd_index(data_dir: Option<PathBuf>, ocr_fps: u32) -> Result<()> {
     info!("starting OCR indexer");
     info!("data directory: {:?}", data_dir);
     info!("OCR rate: {} fps", ocr_fps);
+    if let Some(ref lang) = ocr_language {
+        info!("OCR language: {}", lang);
+    } else {
+        info!("OCR language: en-US (default)");
+    }
 
     // Create indexer
-    let mut indexer = Indexer::new(data_dir, Some(ocr_fps))?;
+    let mut indexer = Indexer::new(data_dir, Some(ocr_fps), ocr_language)?;
 
     // Set up signal handler for graceful shutdown
     let running = Arc::new(AtomicBool::new(true));

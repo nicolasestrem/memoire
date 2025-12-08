@@ -233,13 +233,13 @@ function displayFrameMetadata(frame) {
 async function displayOcrText(frame) {
     const ocrContainer = elements.ocrText;
 
-    if (!frame.ocr_text || frame.ocr_text.length === 0) {
+    if (!frame.ocr || !frame.ocr.text) {
         // Check if OCR is still processing
         try {
             const statsResponse = await fetch('/api/stats/ocr');
             const stats = await statsResponse.json();
 
-            if (stats.processed < stats.total) {
+            if (stats.frames_with_ocr < stats.total_frames) {
                 ocrContainer.innerHTML = '<div class="ocr-processing">⏳ OCR processing in progress... Check back soon.</div>';
             } else {
                 ocrContainer.innerHTML = '<div class="ocr-empty">No text detected in this frame</div>';
@@ -251,7 +251,7 @@ async function displayOcrText(frame) {
     }
 
     // Display OCR text
-    const textContent = frame.ocr_text.map(ocr => ocr.text).join('\n\n');
+    const textContent = frame.ocr.text;
     ocrContainer.innerHTML = `<div>${escapeHtml(textContent)}</div>`;
 }
 
@@ -328,13 +328,13 @@ async function updateOcrStats() {
         const response = await fetch('/api/stats/ocr');
         const stats = await response.json();
 
-        const percentage = stats.total > 0 ? (stats.processed / stats.total) * 100 : 0;
+        const percentage = stats.total_frames > 0 ? (stats.frames_with_ocr / stats.total_frames) * 100 : 0;
 
         elements.ocrProgress.style.width = `${percentage}%`;
-        elements.ocrStatsText.textContent = `${stats.processed} / ${stats.total} frames processed (${percentage.toFixed(1)}%)`;
+        elements.ocrStatsText.textContent = `${stats.frames_with_ocr} / ${stats.total_frames} frames processed (${percentage.toFixed(1)}%)`;
 
         // Stop polling if complete
-        if (stats.processed >= stats.total && stats.total > 0) {
+        if (stats.frames_with_ocr >= stats.total_frames && stats.total_frames > 0) {
             clearInterval(ocrStatsInterval);
             ocrStatsInterval = null;
         }
@@ -356,7 +356,7 @@ async function handleSearch() {
     try {
         elements.searchResults.innerHTML = '<div class="search-loading">⏳ Searching...</div>';
 
-        const params = new URLSearchParams({ query });
+        const params = new URLSearchParams({ q: query });
         const response = await fetch(`/api/search?${params}`);
 
         if (!response.ok) {
@@ -365,12 +365,12 @@ async function handleSearch() {
 
         const results = await response.json();
 
-        if (!results || results.length === 0) {
+        if (!results.results || results.results.length === 0) {
             elements.searchResults.innerHTML = '<div class="search-empty">No results found for your query</div>';
             return;
         }
 
-        displaySearchResults(results);
+        displaySearchResults(results.results);
     } catch (error) {
         console.error('Search error:', error);
         elements.searchResults.innerHTML = '<div class="search-empty">Search failed. Please try again.</div>';
@@ -385,21 +385,21 @@ function displaySearchResults(results) {
     results.forEach(result => {
         const card = document.createElement('div');
         card.className = 'search-result-card';
-        card.onclick = () => handleSearchResultClick(result.frame_id);
+        card.onclick = () => handleSearchResultClick(result.frame.id);
 
-        const timestamp = new Date(result.timestamp).toLocaleString();
+        const timestamp = new Date(result.frame.timestamp).toLocaleString();
 
         // Highlight search terms in snippet
-        const highlightedSnippet = highlightText(result.text, query);
+        const highlightedSnippet = highlightText(result.ocr.text, query);
 
         card.innerHTML = `
             <div class="search-result-header">
                 <div class="search-result-timestamp">${timestamp}</div>
-                <div class="search-result-score">Score: ${result.score.toFixed(2)}</div>
+                <div class="search-result-confidence">Confidence: ${(result.ocr.confidence * 100).toFixed(0)}%</div>
             </div>
             <div class="search-result-snippet">${highlightedSnippet}</div>
             <div class="search-result-meta">
-                Frame #${result.frame_id} - ${result.app_name || 'Unknown App'} - ${result.window_name || 'Unknown Window'}
+                Frame #${result.frame.id} - ${result.frame.app_name || 'Unknown App'} - ${result.frame.window_name || 'Unknown Window'}
             </div>
         `;
 

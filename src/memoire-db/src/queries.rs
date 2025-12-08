@@ -6,11 +6,35 @@ use rusqlite::{params, Connection, Row};
 
 use crate::schema::*;
 
+/// Sanitize a user query for FTS5 search
+/// - Trims whitespace
+/// - Escapes special FTS5 characters by wrapping in quotes
+/// - Returns error for empty queries
+pub fn sanitize_fts5_query(query: &str) -> Result<String> {
+    let trimmed = query.trim();
+
+    if trimmed.is_empty() {
+        anyhow::bail!("Search query cannot be empty");
+    }
+
+    // For simple word/phrase search, wrap in quotes to treat as literal
+    // This avoids FTS5 syntax errors from special characters
+    let sanitized = if trimmed.contains('"') {
+        // If already has quotes, escape internal quotes and wrap
+        format!("\"{}\"", trimmed.replace('"', "\"\""))
+    } else {
+        // Simple case: wrap in quotes for literal match
+        format!("\"{}\"", trimmed)
+    };
+
+    Ok(sanitized)
+}
+
 /// Insert a new video chunk
 pub fn insert_video_chunk(conn: &Connection, chunk: &NewVideoChunk) -> Result<i64> {
     conn.execute(
-        "INSERT INTO video_chunks (file_path, device_name) VALUES (?1, ?2)",
-        params![chunk.file_path, chunk.device_name],
+        "INSERT INTO video_chunks (file_path, device_name, width, height) VALUES (?1, ?2, ?3, ?4)",
+        params![chunk.file_path, chunk.device_name, chunk.width, chunk.height],
     )?;
     Ok(conn.last_insert_rowid())
 }
@@ -19,8 +43,8 @@ pub fn insert_video_chunk(conn: &Connection, chunk: &NewVideoChunk) -> Result<i6
 pub fn insert_frame(conn: &Connection, frame: &NewFrame) -> Result<i64> {
     conn.execute(
         r#"INSERT INTO frames
-           (video_chunk_id, offset_index, timestamp, app_name, window_name, browser_url, focused)
-           VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)"#,
+           (video_chunk_id, offset_index, timestamp, app_name, window_name, browser_url, focused, frame_hash)
+           VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)"#,
         params![
             frame.video_chunk_id,
             frame.offset_index,
@@ -29,6 +53,7 @@ pub fn insert_frame(conn: &Connection, frame: &NewFrame) -> Result<i64> {
             frame.window_name,
             frame.browser_url,
             frame.focused as i32,
+            frame.frame_hash,
         ],
     )?;
     Ok(conn.last_insert_rowid())
@@ -46,8 +71,8 @@ pub fn insert_frames_batch(conn: &Connection, frames: &[NewFrame]) -> Result<Vec
     {
         let mut stmt = tx.prepare_cached(
             r#"INSERT INTO frames
-               (video_chunk_id, offset_index, timestamp, app_name, window_name, browser_url, focused)
-               VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)"#,
+               (video_chunk_id, offset_index, timestamp, app_name, window_name, browser_url, focused, frame_hash)
+               VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)"#,
         )?;
 
         for frame in frames {
@@ -59,6 +84,7 @@ pub fn insert_frames_batch(conn: &Connection, frames: &[NewFrame]) -> Result<Vec
                 frame.window_name,
                 frame.browser_url,
                 frame.focused as i32,
+                frame.frame_hash,
             ])?;
             ids.push(tx.last_insert_rowid());
         }
@@ -80,7 +106,7 @@ pub fn insert_ocr_text(conn: &Connection, ocr: &NewOcrText) -> Result<i64> {
 /// Get video chunk by ID
 pub fn get_video_chunk(conn: &Connection, id: i64) -> Result<Option<VideoChunk>> {
     let mut stmt = conn.prepare(
-        "SELECT id, file_path, device_name, created_at FROM video_chunks WHERE id = ?1",
+        "SELECT id, file_path, device_name, created_at, width, height FROM video_chunks WHERE id = ?1",
     )?;
 
     let chunk = stmt.query_row(params![id], |row| {
@@ -89,6 +115,8 @@ pub fn get_video_chunk(conn: &Connection, id: i64) -> Result<Option<VideoChunk>>
             file_path: row.get(1)?,
             device_name: row.get(2)?,
             created_at: parse_datetime(row, 3)?,
+            width: row.get::<_, Option<i64>>(4)?.map(|v| v as u32),
+            height: row.get::<_, Option<i64>>(5)?.map(|v| v as u32),
         })
     });
 
@@ -103,7 +131,7 @@ pub fn get_video_chunk(conn: &Connection, id: i64) -> Result<Option<VideoChunk>>
 pub fn get_frame(conn: &Connection, id: i64) -> Result<Option<Frame>> {
     let mut stmt = conn.prepare(
         r#"SELECT id, video_chunk_id, offset_index, timestamp, app_name,
-           window_name, browser_url, focused
+           window_name, browser_url, focused, frame_hash
            FROM frames WHERE id = ?1"#,
     )?;
 
@@ -126,7 +154,7 @@ pub fn get_frames_in_range(
 ) -> Result<Vec<Frame>> {
     let mut stmt = conn.prepare(
         r#"SELECT id, video_chunk_id, offset_index, timestamp, app_name,
-           window_name, browser_url, focused
+           window_name, browser_url, focused, frame_hash
            FROM frames
            WHERE timestamp >= ?1 AND timestamp <= ?2
            ORDER BY timestamp DESC
@@ -153,7 +181,7 @@ pub fn search_ocr(
     let mut stmt = conn.prepare(
         r#"SELECT o.id, o.frame_id, o.text, o.text_json, o.confidence,
            f.id, f.video_chunk_id, f.offset_index, f.timestamp, f.app_name,
-           f.window_name, f.browser_url, f.focused
+           f.window_name, f.browser_url, f.focused, f.frame_hash
            FROM ocr_text o
            JOIN ocr_text_fts fts ON o.id = fts.rowid
            JOIN frames f ON o.frame_id = f.id
@@ -180,6 +208,7 @@ pub fn search_ocr(
                 window_name: row.get(10)?,
                 browser_url: row.get(11)?,
                 focused: row.get::<_, i32>(12)? != 0,
+                frame_hash: row.get(13)?,
             };
             Ok((ocr, frame))
         })?
@@ -192,7 +221,7 @@ pub fn search_ocr(
 pub fn get_frames_without_ocr(conn: &Connection, limit: i64) -> Result<Vec<Frame>> {
     let mut stmt = conn.prepare(
         r#"SELECT f.id, f.video_chunk_id, f.offset_index, f.timestamp, f.app_name,
-           f.window_name, f.browser_url, f.focused
+           f.window_name, f.browser_url, f.focused, f.frame_hash
            FROM frames f
            LEFT JOIN ocr_text o ON f.id = o.frame_id
            WHERE o.id IS NULL
@@ -221,7 +250,7 @@ pub fn get_ocr_count(conn: &Connection) -> Result<i64> {
 pub fn get_frame_with_ocr(conn: &Connection, frame_id: i64) -> Result<Option<FrameWithOcr>> {
     let mut stmt = conn.prepare(
         r#"SELECT f.id, f.video_chunk_id, f.offset_index, f.timestamp, f.app_name,
-           f.window_name, f.browser_url, f.focused,
+           f.window_name, f.browser_url, f.focused, f.frame_hash,
            o.id, o.frame_id, o.text, o.text_json, o.confidence
            FROM frames f
            LEFT JOIN ocr_text o ON f.id = o.frame_id
@@ -229,13 +258,13 @@ pub fn get_frame_with_ocr(conn: &Connection, frame_id: i64) -> Result<Option<Fra
     )?;
 
     let result = stmt.query_row(params![frame_id], |row| {
-        let ocr_text = if let Ok(ocr_id) = row.get::<_, i64>(8) {
+        let ocr_text = if let Ok(ocr_id) = row.get::<_, i64>(9) {
             Some(OcrText {
                 id: ocr_id,
-                frame_id: row.get(9)?,
-                text: row.get(10)?,
-                text_json: row.get(11)?,
-                confidence: row.get(12)?,
+                frame_id: row.get(10)?,
+                text: row.get(11)?,
+                text_json: row.get(12)?,
+                confidence: row.get(13)?,
             })
         } else {
             None
@@ -250,6 +279,7 @@ pub fn get_frame_with_ocr(conn: &Connection, frame_id: i64) -> Result<Option<Fra
             window_name: row.get(5)?,
             browser_url: row.get(6)?,
             focused: row.get::<_, i32>(7)? != 0,
+            frame_hash: row.get(8)?,
             ocr_text,
         })
     });
@@ -271,7 +301,7 @@ pub fn get_frames_with_ocr_in_range(
 ) -> Result<Vec<FrameWithOcr>> {
     let mut stmt = conn.prepare(
         r#"SELECT f.id, f.video_chunk_id, f.offset_index, f.timestamp, f.app_name,
-           f.window_name, f.browser_url, f.focused,
+           f.window_name, f.browser_url, f.focused, f.frame_hash,
            o.id, o.frame_id, o.text, o.text_json, o.confidence
            FROM frames f
            LEFT JOIN ocr_text o ON f.id = o.frame_id
@@ -284,13 +314,13 @@ pub fn get_frames_with_ocr_in_range(
         .query_map(
             params![start.to_rfc3339(), end.to_rfc3339(), limit, offset],
             |row| {
-                let ocr_text = if let Ok(ocr_id) = row.get::<_, i64>(8) {
+                let ocr_text = if let Ok(ocr_id) = row.get::<_, i64>(9) {
                     Some(OcrText {
                         id: ocr_id,
-                        frame_id: row.get(9)?,
-                        text: row.get(10)?,
-                        text_json: row.get(11)?,
-                        confidence: row.get(12)?,
+                        frame_id: row.get(10)?,
+                        text: row.get(11)?,
+                        text_json: row.get(12)?,
+                        confidence: row.get(13)?,
                     })
                 } else {
                     None
@@ -305,6 +335,7 @@ pub fn get_frames_with_ocr_in_range(
                     window_name: row.get(5)?,
                     browser_url: row.get(6)?,
                     focused: row.get::<_, i32>(7)? != 0,
+                    frame_hash: row.get(8)?,
                     ocr_text,
                 })
             },
@@ -323,7 +354,7 @@ pub fn get_frame_count(conn: &Connection) -> Result<i64> {
 /// Get latest video chunk
 pub fn get_latest_video_chunk(conn: &Connection) -> Result<Option<VideoChunk>> {
     let mut stmt = conn.prepare(
-        "SELECT id, file_path, device_name, created_at FROM video_chunks ORDER BY id DESC LIMIT 1",
+        "SELECT id, file_path, device_name, created_at, width, height FROM video_chunks ORDER BY id DESC LIMIT 1",
     )?;
 
     let chunk = stmt.query_row([], |row| {
@@ -332,6 +363,8 @@ pub fn get_latest_video_chunk(conn: &Connection) -> Result<Option<VideoChunk>> {
             file_path: row.get(1)?,
             device_name: row.get(2)?,
             created_at: parse_datetime(row, 3)?,
+            width: row.get::<_, Option<i64>>(4)?.map(|v| v as u32),
+            height: row.get::<_, Option<i64>>(5)?.map(|v| v as u32),
         })
     });
 
@@ -353,7 +386,7 @@ pub fn get_chunks_paginated(
 ) -> Result<Vec<ChunkWithFrameCount>> {
     let mut query = String::from(
         r#"SELECT vc.id, vc.file_path, vc.device_name, vc.created_at,
-           COUNT(f.id) as frame_count
+           COUNT(f.id) as frame_count, vc.width, vc.height
            FROM video_chunks vc
            LEFT JOIN frames f ON vc.id = f.video_chunk_id"#,
     );
@@ -398,6 +431,8 @@ pub fn get_chunks_paginated(
                 device_name: row.get(2)?,
                 created_at: parse_datetime(row, 3)?,
                 frame_count: row.get(4)?,
+                width: row.get::<_, Option<i64>>(5)?.map(|v| v as u32),
+                height: row.get::<_, Option<i64>>(6)?.map(|v| v as u32),
             })
         })?
         .collect::<Result<Vec<_>, _>>()?;
@@ -568,6 +603,42 @@ pub fn get_search_count(conn: &Connection, query: &str) -> Result<i64> {
     Ok(count)
 }
 
+/// Get the last frame hash for a video chunk (for deduplication)
+pub fn get_last_frame_hash(conn: &Connection, chunk_id: i64) -> Result<Option<i64>> {
+    let result: rusqlite::Result<i64> = conn.query_row(
+        r#"SELECT frame_hash FROM frames
+           WHERE video_chunk_id = ?1 AND frame_hash IS NOT NULL
+           ORDER BY offset_index DESC
+           LIMIT 1"#,
+        params![chunk_id],
+        |row| row.get(0),
+    );
+
+    match result {
+        Ok(hash) => Ok(Some(hash)),
+        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// Count duplicate frames skipped (frames with same hash as previous)
+pub fn get_skipped_frame_count(conn: &Connection) -> Result<i64> {
+    // Count frames where the previous frame in the same chunk has the same hash
+    let count: i64 = conn.query_row(
+        r#"SELECT COUNT(*) FROM frames f1
+           WHERE EXISTS (
+               SELECT 1 FROM frames f2
+               WHERE f2.video_chunk_id = f1.video_chunk_id
+               AND f2.offset_index = f1.offset_index - 1
+               AND f2.frame_hash = f1.frame_hash
+               AND f1.frame_hash IS NOT NULL
+           )"#,
+        [],
+        |row| row.get(0),
+    )?;
+    Ok(count)
+}
+
 // Helper functions
 
 fn row_to_frame(row: &Row) -> rusqlite::Result<Frame> {
@@ -580,6 +651,7 @@ fn row_to_frame(row: &Row) -> rusqlite::Result<Frame> {
         window_name: row.get(5)?,
         browser_url: row.get(6)?,
         focused: row.get::<_, i32>(7)? != 0,
+        frame_hash: row.get(8)?,
     })
 }
 

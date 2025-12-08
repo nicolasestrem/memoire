@@ -239,12 +239,16 @@ pub async fn search_ocr(
     let limit = params.limit.unwrap_or(50).max(1).min(100);
     let offset = params.offset.unwrap_or(0).max(0);
 
+    // Sanitize the search query for FTS5
+    let sanitized_query = memoire_db::sanitize_fts5_query(&params.q)
+        .map_err(|e| ApiError::BadRequest(e.to_string()))?;
+
     // Get total count
-    let total = memoire_db::get_search_count(&db, &params.q)
+    let total = memoire_db::get_search_count(&db, &sanitized_query)
         .map_err(|e| ApiError::Database(e.to_string()))?;
 
     // Get search results
-    let results = memoire_db::search_ocr(&db, &params.q, limit, offset)
+    let results = memoire_db::search_ocr(&db, &sanitized_query, limit, offset)
         .map_err(|e| ApiError::Database(e.to_string()))?;
 
     // Transform results into response format

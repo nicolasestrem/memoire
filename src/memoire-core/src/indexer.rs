@@ -2,6 +2,7 @@
 
 use anyhow::Result;
 use chrono::{DateTime, Utc};
+use futures::{stream, StreamExt};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
@@ -9,12 +10,14 @@ use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
 use tracing::{debug, error, info, warn};
 
-use memoire_db::{Database, Frame};
+use memoire_db::Database;
 use memoire_ocr::{FrameData, Processor as OcrProcessor};
 
 /// OCR batch settings
 const OCR_BATCH_SIZE: usize = 30;
 const DEFAULT_OCR_FPS: u32 = 10;
+/// Maximum concurrent frame extractions (limited by FFmpeg processes)
+const MAX_CONCURRENT_EXTRACTIONS: usize = 4;
 
 /// Statistics for OCR processing
 #[derive(Debug, Clone)]
@@ -38,15 +41,25 @@ pub struct Indexer {
 }
 
 impl Indexer {
-    /// Create a new indexer
-    pub fn new(data_dir: PathBuf, ocr_fps: Option<u32>) -> Result<Self> {
+    /// Create a new indexer with optional language configuration
+    pub fn new(data_dir: PathBuf, ocr_fps: Option<u32>, ocr_language: Option<String>) -> Result<Self> {
         info!("initializing OCR indexer");
 
         let db_path = data_dir.join("memoire.db");
         let db = Database::open(&db_path)?;
         info!("database opened at {:?}", db_path);
 
-        let processor = OcrProcessor::new()?;
+        // Create processor with specified language or default to English
+        let processor = match ocr_language {
+            Some(ref lang) => {
+                info!("initializing OCR processor with language: {}", lang);
+                OcrProcessor::with_language(lang)?
+            }
+            None => {
+                info!("initializing OCR processor with default language (en-US)");
+                OcrProcessor::new()?
+            }
+        };
         info!("OCR processor initialized");
 
         let stats = IndexerStats {
@@ -156,27 +169,71 @@ impl Indexer {
             return Ok(0);
         }
 
-        debug!("processing batch of {} frames", frames.len());
+        debug!("processing batch of {} frames concurrently", frames.len());
 
-        // Extract frames from video chunks
-        let mut ocr_results = Vec::new();
+        // Step 1: Extract all frames concurrently using spawn_blocking
+        // This is the expensive I/O-bound FFmpeg operation
+        let extraction_tasks: Vec<_> = frames.iter().map(|frame| {
+            let frame_id = frame.id;
+            let video_chunk_id = frame.video_chunk_id;
+            let offset_index = frame.offset_index;
+            let data_dir = self.data_dir.clone();
+            let db_conn = self.db.connection();
 
-        for frame in &frames {
-            match self.extract_and_process_frame(frame).await {
-                Ok(result) => {
-                    ocr_results.push((frame.id, result));
+            async move {
+                // Get video chunk info (cheap database lookup)
+                let chunk = match memoire_db::get_video_chunk(db_conn, video_chunk_id) {
+                    Ok(Some(c)) => c,
+                    Ok(None) => {
+                        return (frame_id, Err(anyhow::anyhow!("video chunk {} not found", video_chunk_id)));
+                    }
+                    Err(e) => {
+                        return (frame_id, Err(e));
+                    }
+                };
+
+                let video_path = data_dir.join(&chunk.file_path);
+                let cached_width = chunk.width;
+                let cached_height = chunk.height;
+
+                // Run FFmpeg extraction in a blocking task
+                let extraction_result = tokio::task::spawn_blocking(move || {
+                    Self::extract_frame_from_video_static(&video_path, offset_index, cached_width, cached_height)
+                }).await;
+
+                match extraction_result {
+                    Ok(Ok(frame_data)) => (frame_id, Ok(frame_data)),
+                    Ok(Err(e)) => (frame_id, Err(e)),
+                    Err(e) => (frame_id, Err(anyhow::anyhow!("spawn_blocking failed: {}", e))),
+                }
+            }
+        }).collect();
+
+        // Execute extractions concurrently with limited concurrency
+        let extracted_frames: Vec<_> = stream::iter(extraction_tasks)
+            .buffer_unordered(MAX_CONCURRENT_EXTRACTIONS)
+            .collect()
+            .await;
+
+        // Step 2: Process OCR sequentially (Windows OCR may not be thread-safe)
+        let mut ocr_results = Vec::with_capacity(frames.len());
+
+        for (frame_id, extraction_result) in extracted_frames {
+            match extraction_result {
+                Ok(frame_data) => {
+                    match self.processor.process_frame(frame_data).await {
+                        Ok(result) => {
+                            ocr_results.push((frame_id, result));
+                        }
+                        Err(e) => {
+                            warn!("OCR failed for frame {}: {}", frame_id, e);
+                            ocr_results.push((frame_id, empty_ocr_result()));
+                        }
+                    }
                 }
                 Err(e) => {
-                    warn!("failed to process frame {}: {}", frame.id, e);
-                    // Insert empty OCR result to mark as processed
-                    ocr_results.push((
-                        frame.id,
-                        memoire_ocr::OcrFrameResult {
-                            text: String::new(),
-                            lines: Vec::new(),
-                            confidence: 0.0,
-                        },
-                    ));
+                    warn!("failed to extract frame {}: {}", frame_id, e);
+                    ocr_results.push((frame_id, empty_ocr_result()));
                 }
             }
         }
@@ -190,30 +247,15 @@ impl Indexer {
         Ok(count)
     }
 
-    /// Extract frame from video and perform OCR
-    async fn extract_and_process_frame(&self, frame: &Frame) -> Result<memoire_ocr::OcrFrameResult> {
-        // Get video chunk info
-        let chunk = memoire_db::get_video_chunk(self.db.connection(), frame.video_chunk_id)?
-            .ok_or_else(|| anyhow::anyhow!("video chunk {} not found", frame.video_chunk_id))?;
-
-        // Build full path to video file
-        let video_path = self.data_dir.join(&chunk.file_path);
-
-        if !video_path.exists() {
-            return Err(anyhow::anyhow!("video file not found: {:?}", video_path));
-        }
-
-        // Extract frame using FFmpeg
-        let frame_data = self.extract_frame_from_video(&video_path, frame.offset_index)?;
-
-        // Perform OCR
-        let result = self.processor.process_frame(frame_data).await?;
-
-        Ok(result)
-    }
-
-    /// Extract a specific frame from video using FFmpeg command-line tool
-    fn extract_frame_from_video(&self, video_path: &PathBuf, frame_index: i64) -> Result<FrameData> {
+    /// Extract a specific frame from video using FFmpeg command-line tool (static version)
+    /// If cached_width/cached_height are provided, skips the ffprobe call for better performance.
+    /// This static version allows calling from spawn_blocking without borrowing self.
+    fn extract_frame_from_video_static(
+        video_path: &PathBuf,
+        frame_index: i64,
+        cached_width: Option<u32>,
+        cached_height: Option<u32>,
+    ) -> Result<FrameData> {
         use std::process::{Command, Stdio};
         use std::io::Read;
 
@@ -250,28 +292,35 @@ impl Indexer {
             return Err(anyhow::anyhow!("ffmpeg failed with exit code {:?}", status.code()));
         }
 
-        // Get video dimensions using ffprobe
-        let probe_output = Command::new("ffprobe")
-            .arg("-v")
-            .arg("error")
-            .arg("-select_streams")
-            .arg("v:0")
-            .arg("-show_entries")
-            .arg("stream=width,height")
-            .arg("-of")
-            .arg("csv=p=0")
-            .arg(video_path)
-            .output()
-            .map_err(|e| anyhow::anyhow!("failed to run ffprobe: {}", e))?;
+        // Use cached dimensions if available, otherwise fall back to ffprobe
+        let (width, height) = match (cached_width, cached_height) {
+            (Some(w), Some(h)) => (w, h),
+            _ => {
+                // Fall back to ffprobe for legacy chunks without cached dimensions
+                let probe_output = Command::new("ffprobe")
+                    .arg("-v")
+                    .arg("error")
+                    .arg("-select_streams")
+                    .arg("v:0")
+                    .arg("-show_entries")
+                    .arg("stream=width,height")
+                    .arg("-of")
+                    .arg("csv=p=0")
+                    .arg(video_path)
+                    .output()
+                    .map_err(|e| anyhow::anyhow!("failed to run ffprobe: {}", e))?;
 
-        let dimensions = String::from_utf8_lossy(&probe_output.stdout);
-        let parts: Vec<&str> = dimensions.trim().split(',').collect();
-        if parts.len() != 2 {
-            return Err(anyhow::anyhow!("invalid ffprobe output: {}", dimensions));
-        }
+                let dimensions = String::from_utf8_lossy(&probe_output.stdout);
+                let parts: Vec<&str> = dimensions.trim().split(',').collect();
+                if parts.len() != 2 {
+                    return Err(anyhow::anyhow!("invalid ffprobe output: {}", dimensions));
+                }
 
-        let width: u32 = parts[0].parse()?;
-        let height: u32 = parts[1].parse()?;
+                let w: u32 = parts[0].parse()?;
+                let h: u32 = parts[1].parse()?;
+                (w, h)
+            }
+        };
 
         // Validate frame data size
         let expected_size = (width * height * 4) as usize;
@@ -327,5 +376,14 @@ impl Indexer {
         stats.last_updated = Utc::now();
 
         Ok(())
+    }
+}
+
+/// Create an empty OCR result for frames that fail extraction or OCR
+fn empty_ocr_result() -> memoire_ocr::OcrFrameResult {
+    memoire_ocr::OcrFrameResult {
+        text: String::new(),
+        lines: Vec::new(),
+        confidence: 0.0,
     }
 }
