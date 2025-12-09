@@ -1035,3 +1035,18 @@ pub fn get_audio_search_count(conn: &Connection, query: &str) -> Result<i64> {
     )?;
     Ok(count)
 }
+
+/// Delete all OCR records with empty text (for re-indexing after bug fixes)
+pub fn reset_empty_ocr(conn: &Connection) -> Result<usize> {
+    let deleted = conn.execute(
+        "DELETE FROM ocr_text WHERE text = ''",
+        [],
+    )?;
+    Ok(deleted)
+}
+
+/// Delete ALL OCR records (for complete re-indexing)
+pub fn reset_all_ocr(conn: &Connection) -> Result<usize> {
+    let deleted = conn.execute("DELETE FROM ocr_text", [])?;
+    Ok(deleted)
+}

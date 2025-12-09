@@ -119,6 +119,17 @@ enum Commands {
         limit: i64,
     },
 
+    /// Reset OCR data (clear empty records for re-indexing)
+    ResetOcr {
+        /// Data directory for videos and database
+        #[arg(short, long)]
+        data_dir: Option<PathBuf>,
+
+        /// Clear ALL OCR records, not just empty ones
+        #[arg(long)]
+        all: bool,
+    },
+
     /// List available audio devices
     AudioDevices,
 
@@ -199,6 +210,9 @@ fn main() -> Result<()> {
         }
         Commands::Search { query, data_dir, limit } => {
             cmd_search(query, data_dir, limit)?;
+        }
+        Commands::ResetOcr { data_dir, all } => {
+            cmd_reset_ocr(data_dir, all)?;
         }
         Commands::AudioDevices => {
             cmd_audio_devices()?;
@@ -524,6 +538,30 @@ fn cmd_search(query: String, data_dir: Option<PathBuf>, limit: i64) -> Result<()
     Ok(())
 }
 
+fn cmd_reset_ocr(data_dir: Option<PathBuf>, clear_all: bool) -> Result<()> {
+    // Resolve data directory
+    let data_dir = data_dir.unwrap_or_else(|| {
+        dirs::data_local_dir()
+            .unwrap_or_else(|| PathBuf::from("."))
+            .join("Memoire")
+    });
+
+    let db_path = data_dir.join("memoire.db");
+    let db = memoire_db::Database::open(&db_path)?;
+
+    if clear_all {
+        println!("clearing ALL OCR records...");
+        memoire_db::reset_all_ocr(db.connection())?;
+        println!("✓ all OCR records cleared");
+    } else {
+        println!("clearing empty OCR records...");
+        let deleted = memoire_db::reset_empty_ocr(db.connection())?;
+        println!("✓ cleared {} empty OCR records", deleted);
+    }
+
+    Ok(())
+}
+
 fn cmd_audio_devices() -> Result<()> {
     println!("enumerating audio devices...\n");
 
@@ -747,5 +785,24 @@ async fn cmd_download_models(data_dir: Option<PathBuf>, force: bool) -> Result<(
     downloader.download_all(force).await?;
 
     println!("\nDownload complete! You can now run 'memoire audio-index' to transcribe audio.");
+=======
+        return Err(anyhow::anyhow!("database not found"));
+    }
+
+    let db = memoire_db::Database::open(&db_path)?;
+
+    if clear_all {
+        // Clear ALL OCR records
+        let deleted = db.connection().execute("DELETE FROM ocr_text", [])?;
+        info!("deleted {} OCR record(s)", deleted);
+        println!("cleared {} OCR record(s)", deleted);
+    } else {
+        // Only clear empty OCR records
+        let deleted = memoire_db::delete_empty_ocr_records(db.connection())?;
+        info!("deleted {} empty OCR record(s)", deleted);
+        println!("cleared {} empty OCR record(s)", deleted);
+    }
+
+    println!("run 'memoire index' to re-process frames");
     Ok(())
 }
