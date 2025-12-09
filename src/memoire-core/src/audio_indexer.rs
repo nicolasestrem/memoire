@@ -158,7 +158,7 @@ impl AudioIndexer {
     }
 
     /// Process a batch of audio chunks without transcription
-    async fn process_batch(&self) -> Result<usize> {
+    async fn process_batch(&mut self) -> Result<usize> {
         // Query audio chunks without transcription
         let chunks = memoire_db::get_audio_chunks_without_transcription(
             self.db.connection(),
@@ -169,7 +169,7 @@ impl AudioIndexer {
             return Ok(0);
         }
 
-        debug!("processing batch of {} audio chunks", chunks.len());
+        info!("processing batch of {} audio chunks", chunks.len());
 
         let mut processed_count = 0;
 
@@ -223,9 +223,10 @@ impl AudioIndexer {
                         self.insert_empty_transcription(chunk.id)?;
                     }
 
-                    debug!(
-                        "transcribed chunk {}: {} chars, {} segments, {}ms",
+                    info!(
+                        "transcribed chunk {}: '{}' ({} chars, {} segments, {}ms)",
                         chunk.id,
+                        if result.text.len() > 100 { &result.text[..100] } else { &result.text },
                         result.text.len(),
                         result.segments.len(),
                         result.processing_time_ms

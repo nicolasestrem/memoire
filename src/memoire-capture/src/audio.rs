@@ -1,7 +1,6 @@
 //! WASAPI audio capture for Windows
 //!
-//! Supports input device (microphone) capture.
-//! Loopback capture will be added in a future update.
+//! Supports both input device (microphone) and loopback (system audio) capture.
 
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
@@ -49,7 +48,7 @@ pub struct CapturedAudio {
 pub struct AudioCaptureConfig {
     /// Specific device ID to capture from (None = default device)
     pub device_id: Option<String>,
-    /// Whether to capture in loopback mode (system audio) - NOT YET IMPLEMENTED
+    /// Whether to capture in loopback mode (system audio)
     pub is_loopback: bool,
     /// Chunk duration in seconds
     pub chunk_duration_secs: u32,
@@ -157,10 +156,6 @@ impl AudioCapture {
 
     /// Create a new audio capture instance
     pub fn new(config: AudioCaptureConfig) -> Result<Self> {
-        if config.is_loopback {
-            return Err(anyhow::anyhow!("Loopback capture is not yet implemented"));
-        }
-
         // Initialize COM for this thread
         let _ = wasapi::initialize_mta();
 
@@ -171,6 +166,10 @@ impl AudioCapture {
             // Find specific device by ID
             enumerator.get_device(device_id)
                 .context(format!("Device not found: {}", device_id))?
+        } else if config.is_loopback {
+            // Use default render device for loopback capture
+            enumerator.get_default_device(&Direction::Render)
+                .context("Failed to get default render device for loopback")?
         } else {
             // Use default capture device
             enumerator.get_default_device(&Direction::Capture)
@@ -186,8 +185,8 @@ impl AudioCapture {
         let channels = format.get_nchannels() as u16;
 
         info!(
-            "audio capture initialized: {} ({} Hz, {} ch)",
-            device_name, sample_rate, channels
+            "audio capture initialized: {} ({} Hz, {} ch) [loopback={}]",
+            device_name, sample_rate, channels, config.is_loopback
         );
 
         Ok(Self {
@@ -282,6 +281,8 @@ impl AudioCapture {
 
         let device = if let Some(ref device_id) = config.device_id {
             enumerator.get_device(device_id)?
+        } else if config.is_loopback {
+            enumerator.get_default_device(&Direction::Render)?
         } else {
             enumerator.get_default_device(&Direction::Capture)?
         };
@@ -297,20 +298,40 @@ impl AudioCapture {
             source_sample_rate, source_channels, bits_per_sample, blockalign
         );
 
-        // Use event-driven shared mode
-        let stream_mode = StreamMode::EventsShared {
-            autoconvert: true,
-            buffer_duration_hns: 1_000_000, // 100ms in 100ns units
+        // For loopback: use polling mode (event mode doesn't work with AUDCLNT_STREAMFLAGS_LOOPBACK)
+        // For regular capture: use event-driven mode
+        let (stream_mode, use_polling) = if config.is_loopback {
+            (
+                StreamMode::PollingShared {
+                    autoconvert: true,
+                    buffer_duration_hns: 1_000_000, // 100ms in 100ns units
+                },
+                true,
+            )
+        } else {
+            (
+                StreamMode::EventsShared {
+                    autoconvert: true,
+                    buffer_duration_hns: 1_000_000, // 100ms in 100ns units
+                },
+                false,
+            )
         };
 
         // Initialize audio client
         audio_client.initialize_client(&device_format, &Direction::Capture, &stream_mode)?;
 
         let capture_client = audio_client.get_audiocaptureclient()?;
-        let event_handle = audio_client.set_get_eventhandle()?;
+
+        // Only set event handle for event-driven mode
+        let event_handle = if !use_polling {
+            Some(audio_client.set_get_eventhandle()?)
+        } else {
+            None
+        };
 
         audio_client.start_stream()?;
-        info!("audio capture started");
+        info!("audio capture started (loopback={}, polling={})", config.is_loopback, use_polling);
 
         // Calculate samples per chunk
         let samples_per_chunk = (config.chunk_duration_secs as usize * source_sample_rate as usize) as usize;
@@ -319,9 +340,17 @@ impl AudioCapture {
         let mut raw_buffer: VecDeque<u8> = VecDeque::new();
 
         while running.load(Ordering::Relaxed) {
-            // Wait for audio data (with timeout)
-            if event_handle.wait_for_event(100).is_err() {
-                continue;
+            // Wait for audio data
+            if use_polling {
+                // Polling mode: sleep for a short duration
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            } else {
+                // Event-driven mode: wait for event signal
+                if let Some(ref handle) = event_handle {
+                    if handle.wait_for_event(100).is_err() {
+                        continue;
+                    }
+                }
             }
 
             // Read available frames into deque
@@ -364,7 +393,7 @@ impl AudioCapture {
                     timestamp: chunk_start_time,
                     duration_secs: config.chunk_duration_secs as f32,
                     device_name: device_name.clone(),
-                    is_input_device: true,
+                    is_input_device: !config.is_loopback,
                 };
 
                 // Send chunk

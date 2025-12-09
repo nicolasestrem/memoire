@@ -467,9 +467,7 @@ All Phase A-C implementations verified working:
 
 Database migration v1→v3 applied successfully (added `frame_hash` column).
 
----
-
-## Appendix: Files Reference
+--- ce
 
 ### Modified in Analysis
 | File | Component | Issues Found |

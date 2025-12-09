@@ -135,6 +135,10 @@ enum Commands {
         /// Chunk duration in seconds
         #[arg(long, default_value = "30")]
         chunk_secs: u64,
+
+        /// Enable loopback mode (capture system audio instead of microphone)
+        #[arg(long)]
+        loopback: bool,
     },
 
     /// Run audio transcription indexer
@@ -199,8 +203,8 @@ fn main() -> Result<()> {
         Commands::AudioDevices => {
             cmd_audio_devices()?;
         }
-        Commands::RecordAudio { data_dir, device, chunk_secs } => {
-            cmd_record_audio(data_dir, device, chunk_secs)?;
+        Commands::RecordAudio { data_dir, device, chunk_secs, loopback } => {
+            cmd_record_audio(data_dir, device, chunk_secs, loopback)?;
         }
         Commands::AudioIndex { data_dir, no_gpu } => {
             cmd_audio_index(data_dir, !no_gpu)?;
@@ -547,7 +551,7 @@ fn cmd_audio_devices() -> Result<()> {
 }
 
 #[tokio::main]
-async fn cmd_record_audio(data_dir: Option<PathBuf>, device_id: Option<String>, chunk_secs: u64) -> Result<()> {
+async fn cmd_record_audio(data_dir: Option<PathBuf>, device_id: Option<String>, chunk_secs: u64, loopback: bool) -> Result<()> {
     // Resolve data directory
     let data_dir = data_dir.unwrap_or_else(|| {
         dirs::data_local_dir()
@@ -559,7 +563,7 @@ async fn cmd_record_audio(data_dir: Option<PathBuf>, device_id: Option<String>, 
     let audio_dir = data_dir.join("audio");
     std::fs::create_dir_all(&audio_dir)?;
 
-    info!("starting audio capture");
+    info!("starting audio capture (loopback={})", loopback);
     info!("data directory: {:?}", data_dir);
     info!("chunk duration: {} seconds", chunk_secs);
 
@@ -575,7 +579,7 @@ async fn cmd_record_audio(data_dir: Option<PathBuf>, device_id: Option<String>, 
     // Configure audio capture
     let config = memoire_capture::AudioCaptureConfig {
         device_id: device_id.clone(),
-        is_loopback: false,
+        is_loopback: loopback,
         target_sample_rate: 16000, // 16kHz for STT
         target_channels: 1,        // mono for STT
         chunk_duration_secs: chunk_secs as u32,
@@ -676,6 +680,16 @@ async fn cmd_audio_index(data_dir: Option<PathBuf>, use_gpu: bool) -> Result<()>
     info!("data directory: {:?}", data_dir);
     info!("GPU enabled: {}", use_gpu);
 
+    // Configure ONNX Runtime to use bundled DLL (required for ort 2.0.0-rc.10)
+    // This must be done BEFORE creating the STT engine
+    let model_dir = data_dir.join("models");
+    if memoire_stt::has_bundled_onnx_runtime(&model_dir) {
+        memoire_stt::configure_onnx_runtime(&model_dir)?;
+    } else {
+        warn!("bundled ONNX Runtime not found, using system DLL");
+        warn!("if you get version errors, run 'memoire download-models' first");
+    }
+
     // Create indexer
     let mut indexer = audio_indexer::AudioIndexer::new(data_dir, use_gpu)?;
 
@@ -707,9 +721,9 @@ async fn cmd_download_models(data_dir: Option<PathBuf>, force: bool) -> Result<(
     // Create downloader
     let downloader = memoire_stt::ModelDownloader::new(model_dir.clone());
 
-    // Check if models already exist
-    if !force && downloader.is_complete() {
-        println!("All models already downloaded at {:?}", model_dir);
+    // Check if everything already exists
+    if !force && downloader.is_fully_complete() {
+        println!("All models and ONNX Runtime already downloaded at {:?}", model_dir);
         println!("Use --force to re-download");
         return Ok(());
     }
@@ -719,9 +733,17 @@ async fn cmd_download_models(data_dir: Option<PathBuf>, force: bool) -> Result<(
     if !missing.is_empty() && !force {
         println!("Missing model files: {:?}", missing);
     }
+    if !downloader.has_ort_dll() {
+        println!("ONNX Runtime DLL not found, will download v1.22.0");
+    }
+
+    // Download ONNX Runtime first (required for model inference)
+    // This is needed because the system may have an incompatible version (e.g., 1.17.1)
+    println!("Downloading ONNX Runtime 1.22.0 (~50 MB)...\n");
+    downloader.download_onnx_runtime(force).await?;
 
     // Download models
-    println!("Downloading Parakeet TDT models (~630 MB total)...\n");
+    println!("\nDownloading Parakeet TDT models (~630 MB total)...\n");
     downloader.download_all(force).await?;
 
     println!("\nDownload complete! You can now run 'memoire audio-index' to transcribe audio.");

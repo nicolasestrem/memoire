@@ -783,6 +783,46 @@ pub fn get_transcription_by_chunk(conn: &Connection, chunk_id: i64) -> Result<Op
     }
 }
 
+/// Get all transcriptions for an audio chunk (ordered by start_time)
+pub fn get_transcriptions_by_chunk(conn: &Connection, chunk_id: i64) -> Result<Vec<AudioTranscription>> {
+    let mut stmt = conn.prepare(
+        r#"SELECT id, audio_chunk_id, transcription, timestamp, speaker_id, start_time, end_time
+           FROM audio_transcriptions
+           WHERE audio_chunk_id = ?1
+           ORDER BY start_time ASC NULLS LAST"#,
+    )?;
+
+    let transcriptions = stmt
+        .query_map(params![chunk_id], |row| {
+            Ok(AudioTranscription {
+                id: row.get(0)?,
+                audio_chunk_id: row.get(1)?,
+                transcription: row.get(2)?,
+                timestamp: parse_datetime(row, 3)?,
+                speaker_id: row.get(4)?,
+                start_time: row.get(5)?,
+                end_time: row.get(6)?,
+            })
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+
+    Ok(transcriptions)
+}
+
+/// Get total count of audio chunks
+pub fn get_total_audio_chunk_count(conn: &Connection, device: Option<&str>) -> Result<i64> {
+    let count: i64 = if let Some(dev) = device {
+        conn.query_row(
+            "SELECT COUNT(*) FROM audio_chunks WHERE device_name = ?1",
+            params![dev],
+            |row| row.get(0),
+        )?
+    } else {
+        conn.query_row("SELECT COUNT(*) FROM audio_chunks", [], |row| row.get(0))?
+    };
+    Ok(count)
+}
+
 /// Get count of chunks with transcription
 pub fn get_transcription_count(conn: &Connection) -> Result<i64> {
     let count: i64 = conn.query_row(

@@ -2,6 +2,7 @@
 //!
 //! Downloads pre-packaged int8 quantized models from HuggingFace.
 //! Uses the csukuangfj/sherpa-onnx-nemo-parakeet-tdt-0.6b-v2-int8 repository.
+//! Also downloads the required ONNX Runtime DLL (v1.22.x) for compatibility.
 
 use anyhow::{Context, Result};
 use futures_util::StreamExt;
@@ -9,10 +10,16 @@ use indicatif::{ProgressBar, ProgressStyle};
 use std::path::{Path, PathBuf};
 use tokio::fs::File;
 use tokio::io::AsyncWriteExt;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 /// Base URL for HuggingFace model repository
 const HF_BASE_URL: &str = "https://huggingface.co/csukuangfj/sherpa-onnx-nemo-parakeet-tdt-0.6b-v2-int8/resolve/main";
+
+/// GitHub releases URL for ONNX Runtime
+const ORT_GITHUB_URL: &str = "https://github.com/microsoft/onnxruntime/releases/download/v1.22.0/onnxruntime-win-x64-1.22.0.zip";
+
+/// Expected ONNX Runtime DLL name
+pub const ORT_DLL_NAME: &str = "onnxruntime.dll";
 
 /// Model files to download with their URLs and local names
 /// Using sherpa-onnx int8 quantized models (~630 MB total)
@@ -35,11 +42,26 @@ impl ModelDownloader {
         Self { model_dir }
     }
 
+    /// Get the path to the ONNX Runtime DLL
+    pub fn ort_dll_path(&self) -> PathBuf {
+        self.model_dir.join(ORT_DLL_NAME)
+    }
+
+    /// Check if the ONNX Runtime DLL is present
+    pub fn has_ort_dll(&self) -> bool {
+        self.ort_dll_path().exists()
+    }
+
     /// Check if all required model files are present
     pub fn is_complete(&self) -> bool {
         MODEL_FILES.iter().all(|(_, local_name, _)| {
             self.model_dir.join(local_name).exists()
         })
+    }
+
+    /// Check if all files including ONNX Runtime are present
+    pub fn is_fully_complete(&self) -> bool {
+        self.is_complete() && self.has_ort_dll()
     }
 
     /// Get list of missing model files
@@ -94,6 +116,81 @@ impl ModelDownloader {
 
         info!("Download complete! Models saved to {:?}", self.model_dir);
         Ok(())
+    }
+
+    /// Download ONNX Runtime DLL (v1.22.x) required for model inference
+    ///
+    /// This is needed because the system may have an incompatible version installed.
+    /// The `ort` crate 2.0.0-rc.10 requires ONNX Runtime 1.22.x.
+    pub async fn download_onnx_runtime(&self, force: bool) -> Result<()> {
+        let dll_path = self.ort_dll_path();
+
+        if dll_path.exists() && !force {
+            info!("ONNX Runtime DLL already exists at {:?}, skipping", dll_path);
+            return Ok(());
+        }
+
+        // Create model directory if it doesn't exist
+        tokio::fs::create_dir_all(&self.model_dir)
+            .await
+            .context("Failed to create model directory")?;
+
+        info!("Downloading ONNX Runtime 1.22.0 for Windows x64...");
+
+        let client = reqwest::Client::new();
+
+        // Download the zip file
+        let zip_path = self.model_dir.join("onnxruntime.zip");
+        self.download_file(&client, ORT_GITHUB_URL, &zip_path).await?;
+
+        // Extract the DLL from the zip
+        info!("Extracting onnxruntime.dll from archive...");
+        self.extract_ort_dll(&zip_path, &dll_path).await?;
+
+        // Clean up the zip file
+        if let Err(e) = tokio::fs::remove_file(&zip_path).await {
+            warn!("Failed to clean up zip file: {}", e);
+        }
+
+        info!("ONNX Runtime DLL installed at {:?}", dll_path);
+        Ok(())
+    }
+
+    /// Extract onnxruntime.dll from the downloaded zip archive
+    async fn extract_ort_dll(&self, zip_path: &Path, dll_path: &Path) -> Result<()> {
+        use std::io::Read;
+
+        // Read the zip file synchronously (zip crate doesn't support async)
+        let zip_data = tokio::fs::read(zip_path)
+            .await
+            .context("Failed to read zip file")?;
+
+        let reader = std::io::Cursor::new(zip_data);
+        let mut archive = zip::ZipArchive::new(reader)
+            .context("Failed to open zip archive")?;
+
+        // Find and extract onnxruntime.dll
+        // The DLL is typically at: onnxruntime-win-x64-1.22.0/lib/onnxruntime.dll
+        for i in 0..archive.len() {
+            let mut file = archive.by_index(i)?;
+            let name = file.name();
+
+            if name.ends_with("onnxruntime.dll") && !name.contains("providers") {
+                info!("Found DLL at: {}", name);
+
+                let mut contents = Vec::new();
+                file.read_to_end(&mut contents)
+                    .context("Failed to read DLL from archive")?;
+
+                tokio::fs::write(dll_path, &contents)
+                    .await
+                    .context("Failed to write DLL file")?;
+
+                return Ok(());
+            }
+        }
+
+        Err(anyhow::anyhow!("onnxruntime.dll not found in archive"))
     }
 
     /// Download a single file with progress reporting

@@ -37,3 +37,6 @@ indicatif = "0.17"
 
 # Platform directories for model storage
 dirs = "5.0"
+
+# Zip extraction for ONNX Runtime download
+zip = "2.2"
