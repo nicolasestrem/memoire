@@ -15,6 +15,9 @@ mod config;
 mod tray;
 mod indexer;
 mod audio_indexer;
+mod test_config;
+mod orchestrator;
+mod colored_logger;
 
 use recorder::Recorder;
 use config::Config;
@@ -173,18 +176,35 @@ enum Commands {
         #[arg(long)]
         force: bool,
     },
+
+    /// Run all components for testing (record + index + audio-index + viewer)
+    TestAll {
+        /// Path to test configuration file
+        #[arg(long, default_value = "test-config.toml")]
+        config: PathBuf,
+
+        /// Profile to use from config file (e.g., "quick", "full")
+        #[arg(long)]
+        profile: Option<String>,
+
+        /// Override data directory
+        #[arg(long)]
+        data_dir: Option<PathBuf>,
+    },
 }
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
 
-    // Initialize logging
-    let level = if cli.verbose { Level::DEBUG } else { Level::INFO };
-    FmtSubscriber::builder()
-        .with_max_level(level)
-        .with_target(false)
-        .compact()
-        .init();
+    // Initialize logging (skip for test-all which uses colored logger)
+    if !matches!(cli.command, Commands::TestAll { .. }) {
+        let level = if cli.verbose { Level::DEBUG } else { Level::INFO };
+        FmtSubscriber::builder()
+            .with_max_level(level)
+            .with_target(false)
+            .compact()
+            .init();
+    }
 
     match cli.command {
         Commands::Record { data_dir, fps, no_hw } => {
@@ -225,6 +245,9 @@ fn main() -> Result<()> {
         }
         Commands::DownloadModels { data_dir, force } => {
             cmd_download_models(data_dir, force)?;
+        }
+        Commands::TestAll { config, profile, data_dir } => {
+            cmd_test_all(config, profile, data_dir)?;
         }
     }
 
@@ -465,16 +488,16 @@ async fn cmd_index(data_dir: Option<PathBuf>, ocr_fps: u32, ocr_language: Option
     let mut indexer = Indexer::new(data_dir, Some(ocr_fps), ocr_language)?;
 
     // Set up signal handler for graceful shutdown
-    let running = Arc::new(AtomicBool::new(true));
-    let r = running.clone();
+    let shutdown = Arc::new(AtomicBool::new(false));
+    let shutdown_handler = shutdown.clone();
 
     ctrlc::set_handler(move || {
         warn!("received shutdown signal, stopping indexer...");
-        r.store(false, Ordering::Relaxed);
+        shutdown_handler.store(true, Ordering::Relaxed);
     })?;
 
     // Run indexer until Ctrl+C
-    indexer.run().await?;
+    indexer.run(shutdown).await?;
 
     info!("indexer stopped");
     Ok(())
@@ -732,16 +755,16 @@ async fn cmd_audio_index(data_dir: Option<PathBuf>, use_gpu: bool) -> Result<()>
     let mut indexer = audio_indexer::AudioIndexer::new(data_dir, use_gpu)?;
 
     // Set up signal handler for graceful shutdown
-    let running = Arc::new(AtomicBool::new(true));
-    let r = running.clone();
+    let shutdown = Arc::new(AtomicBool::new(false));
+    let shutdown_handler = shutdown.clone();
 
     ctrlc::set_handler(move || {
         warn!("received shutdown signal, stopping audio indexer...");
-        r.store(false, Ordering::Relaxed);
+        shutdown_handler.store(true, Ordering::Relaxed);
     })?;
 
     // Run indexer until Ctrl+C
-    indexer.run().await?;
+    indexer.run(shutdown).await?;
 
     info!("audio indexer stopped");
     Ok(())
@@ -786,4 +809,43 @@ async fn cmd_download_models(data_dir: Option<PathBuf>, force: bool) -> Result<(
 
     println!("\nDownload complete! You can now run 'memoire audio-index' to transcribe audio.");
     Ok(())
+}
+
+/// Run all components in orchestrated mode for testing
+#[tokio::main]
+async fn cmd_test_all(
+    config_path: PathBuf,
+    profile: Option<String>,
+    data_dir_override: Option<PathBuf>,
+) -> Result<()> {
+    use colored_logger::Component;
+    use orchestrator::Orchestrator;
+    use test_config::TestConfig;
+
+    // Initialize colored logger for orchestrator
+    colored_logger::init_component_logger(Component::Orchestrator)?;
+
+    // Load configuration
+    let mut config = if config_path.exists() {
+        info!("Loading config from {:?}", config_path);
+        TestConfig::from_file(&config_path)?
+    } else {
+        warn!("Config file not found, using defaults");
+        TestConfig::default()
+    };
+
+    // Apply profile if specified
+    if let Some(profile_name) = profile {
+        info!("Applying profile: {}", profile_name);
+        config = config.apply_profile(&profile_name)?;
+    }
+
+    // Override data directory if provided
+    if let Some(dir) = data_dir_override {
+        config.general.data_dir = Some(dir.to_string_lossy().to_string());
+    }
+
+    // Run orchestrator
+    let orchestrator = Orchestrator::new(config);
+    orchestrator.run().await
 }

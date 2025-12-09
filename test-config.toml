@@ -1,0 +1,37 @@
+# Memoire Test Configuration
+# Configuration for running all components simultaneously during development/testing
+
+[general]
+data_dir = "test-data"
+auto_download_models = true
+
+[record]
+fps = 0.25  # 1 frame every 4 seconds for fast testing
+use_hw_encoding = true
+chunk_duration_secs = 30  # Reduced from default 300s for faster OCR indexing
+
+[index]
+ocr_fps = 10
+# ocr_language = "en-US"  # Optional override
+
+[audio]
+enabled = true
+# device = "Microphone (Realtek Audio)"  # Optional specific device
+
+[viewer]
+port = 8080
+
+# Quick test profile - minimal capture for fast iteration
+[profiles.quick]
+record = { fps = 0.1, use_hw_encoding = true }
+index = { ocr_fps = 5 }
+
+# Full test profile - normal production settings
+[profiles.full]
+record = { fps = 1.0, use_hw_encoding = true }
+index = { ocr_fps = 15 }
+
+# Stress test profile - maximum throughput
+[profiles.stress]
+record = { fps = 2.0, use_hw_encoding = true }
+index = { ocr_fps = 30 }

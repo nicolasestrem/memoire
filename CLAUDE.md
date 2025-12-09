@@ -43,6 +43,66 @@ memoire monitors                                      # List displays
 memoire check                                         # Verify dependencies
 ```
 
+## Unified Testing Command
+
+For development and testing, use the `test-all` command to run all components simultaneously:
+
+```bash
+# Run with default test configuration
+memoire test-all
+
+# Use a specific profile (quick, full, stress)
+memoire test-all --profile quick
+
+# Override data directory
+memoire test-all --data-dir my-test-data
+
+# Use custom config file
+memoire test-all --config custom-test.toml
+```
+
+### Configuration File
+
+The `test-config.toml` file (project root) defines test parameters:
+
+```toml
+[general]
+data_dir = "test-data"
+auto_download_models = true
+
+[record]
+fps = 0.25  # 1 frame every 4 seconds for fast testing
+
+[index]
+ocr_fps = 10
+
+[audio]
+enabled = true
+
+[viewer]
+port = 8080
+
+# Profiles for different test scenarios
+[profiles.quick]
+record = { fps = 0.1 }
+index = { ocr_fps = 5 }
+
+[profiles.full]
+record = { fps = 1.0 }
+index = { ocr_fps = 15 }
+```
+
+### Components Started
+
+The orchestrator manages:
+1. **Recorder** - Captures screens at configured FPS
+2. **OCR Indexer** - Extracts text from frames
+3. **Audio Indexer** - Transcribes audio (if enabled)
+4. **Web Viewer** - Serves UI on http://localhost:8080
+
+All components shut down gracefully with Ctrl+C.
+
+---
 
 2Do: Update with
 

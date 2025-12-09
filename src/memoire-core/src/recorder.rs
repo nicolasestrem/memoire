@@ -2,9 +2,11 @@
 
 use anyhow::Result;
 use chrono::Utc;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use tokio::sync::broadcast;
 use tracing::{debug, error, info, warn};
 
 use memoire_capture::{Monitor, MonitorInfo, ScreenCapture, screen::CapturedFrame};
@@ -22,6 +24,14 @@ const FRAME_FLUSH_INTERVAL: Duration = Duration::from_secs(5);
 /// 0 = exact match only, 5 = ~92% similar, 10 = ~85% similar
 const DEFAULT_DEDUP_THRESHOLD: u32 = 5;
 
+/// Event emitted when a video chunk is finalized and ready for indexing
+#[derive(Debug, Clone)]
+pub struct ChunkFinalizedEvent {
+    pub chunk_id: i64,
+    pub video_path: PathBuf,
+    pub monitor_name: String,
+}
+
 /// Per-monitor recording state
 struct MonitorRecorder {
     info: MonitorInfo,
@@ -37,10 +47,17 @@ struct MonitorRecorder {
     last_frame_hash: Option<u64>,
     /// Counter for skipped duplicate frames
     skipped_frames: u64,
+    /// Broadcast channel for chunk finalization events
+    chunk_finalized_tx: broadcast::Sender<ChunkFinalizedEvent>,
 }
 
 impl MonitorRecorder {
-    fn new(monitor: Monitor, videos_dir: &std::path::Path, config: &Config) -> Result<Self> {
+    fn new(
+        monitor: Monitor,
+        videos_dir: &std::path::Path,
+        config: &Config,
+        chunk_finalized_tx: broadcast::Sender<ChunkFinalizedEvent>,
+    ) -> Result<Self> {
         info!(
             "initializing capture for monitor: {} ({}x{})",
             monitor.info.name, monitor.info.width, monitor.info.height
@@ -75,6 +92,7 @@ impl MonitorRecorder {
             last_db_flush: Instant::now(),
             last_frame_hash: None,
             skipped_frames: 0,
+            chunk_finalized_tx,
         })
     }
 
@@ -198,6 +216,19 @@ impl MonitorRecorder {
 
         if let Some(path) = self.encoder.finalize_chunk()? {
             info!("finalized chunk for {}: {:?}", self.info.name, path);
+
+            // Emit chunk finalized event for indexers
+            if let Some(chunk_id) = self.current_chunk_id {
+                let event = ChunkFinalizedEvent {
+                    chunk_id,
+                    video_path: path.clone(),
+                    monitor_name: self.info.name.clone(),
+                };
+
+                // Send event (ignore error if no receivers - indexers might not be running)
+                let _ = self.chunk_finalized_tx.send(event);
+            }
+
             self.chunk_index += 1;
         }
         self.current_chunk_id = None;
@@ -210,12 +241,17 @@ pub struct Recorder {
     config: Config,
     db: Database,
     monitors: Vec<MonitorRecorder>,
+    chunk_finalized_tx: broadcast::Sender<ChunkFinalizedEvent>,
 }
 
 impl Recorder {
     /// Create a new recorder for all available monitors
     pub fn new(config: Config) -> Result<Self> {
         info!("initializing multi-monitor recorder");
+
+        // Create broadcast channel for chunk finalization events
+        // Capacity of 100 allows buffering events if indexers are slow to subscribe
+        let (chunk_finalized_tx, _rx) = broadcast::channel(100);
 
         // Create directories
         std::fs::create_dir_all(&config.data_dir)?;
@@ -235,7 +271,7 @@ impl Recorder {
         for info in monitor_infos {
             match Monitor::from_info(info.clone()) {
                 Ok(monitor) => {
-                    match MonitorRecorder::new(monitor, &videos_dir, &config) {
+                    match MonitorRecorder::new(monitor, &videos_dir, &config, chunk_finalized_tx.clone()) {
                         Ok(recorder) => {
                             monitors.push(recorder);
                         }
@@ -260,11 +296,20 @@ impl Recorder {
             config,
             db,
             monitors,
+            chunk_finalized_tx,
         })
     }
 
+    /// Subscribe to chunk finalization events
+    ///
+    /// Returns a receiver that will be notified when video chunks are finalized
+    /// and ready for indexing. Each subscriber gets its own receiver.
+    pub fn subscribe_to_chunk_events(&self) -> broadcast::Receiver<ChunkFinalizedEvent> {
+        self.chunk_finalized_tx.subscribe()
+    }
+
     /// Run the recording loop for all monitors
-    pub fn run(&mut self, running: Arc<AtomicBool>) -> Result<()> {
+    pub fn run(&mut self, shutdown: Arc<AtomicBool>) -> Result<()> {
         info!(
             "starting recording loop at {} FPS for {} monitor(s)",
             self.config.fps,
@@ -274,27 +319,31 @@ impl Recorder {
         let frame_interval = Duration::from_secs_f64(1.0 / self.config.fps as f64);
         let mut last_capture = Instant::now();
         let mut total_frames = 0u64;
+        let mut capture_attempts = 0u64;
         let max_consecutive_errors = 10;
 
-        while running.load(Ordering::SeqCst) {
+        while !shutdown.load(Ordering::SeqCst) {
             // Wait for next frame time
             let elapsed = last_capture.elapsed();
             if elapsed < frame_interval {
                 std::thread::sleep(frame_interval - elapsed);
             }
             last_capture = Instant::now();
+            capture_attempts += 1;
 
             // Capture from all monitors
             let mut any_captured = false;
             let mut monitors_to_reinit = Vec::new();
 
+            let mut no_frame_count = 0;
             for (i, monitor) in self.monitors.iter_mut().enumerate() {
                 match monitor.capture_frame(&self.db) {
                     Ok(true) => {
                         any_captured = true;
                     }
                     Ok(false) => {
-                        // No new frame (static screen)
+                        // No new frame (static screen or DXGI timeout)
+                        no_frame_count += 1;
                     }
                     Err(e) => {
                         error!("capture error on {}: {}", monitor.info.name, e);
@@ -305,6 +354,14 @@ impl Recorder {
                         }
                     }
                 }
+            }
+
+            // Log if ALL monitors returned no frames (potential DXGI issue)
+            if no_frame_count > 0 && no_frame_count == self.monitors.len() && capture_attempts % 30 == 0 {
+                warn!(
+                    "no frames captured in last 30 seconds ({} total attempts, {} successful) across {} monitors - screen may be static/locked or DXGI not working",
+                    capture_attempts, total_frames, self.monitors.len()
+                );
             }
 
             // Reinitialize monitors that had too many errors

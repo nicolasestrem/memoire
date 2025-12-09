@@ -236,6 +236,27 @@ pub fn get_frames_without_ocr(conn: &Connection, limit: i64) -> Result<Vec<Frame
     Ok(frames)
 }
 
+/// Get frames from a specific video chunk that need OCR processing
+pub fn get_frames_for_chunk_without_ocr(
+    conn: &Connection,
+    chunk_id: i64,
+) -> Result<Vec<Frame>> {
+    let mut stmt = conn.prepare(
+        r#"SELECT f.id, f.video_chunk_id, f.offset_index, f.timestamp, f.app_name,
+           f.window_name, f.browser_url, f.focused, f.frame_hash
+           FROM frames f
+           LEFT JOIN ocr_text o ON f.id = o.frame_id
+           WHERE o.id IS NULL AND f.video_chunk_id = ?1
+           ORDER BY f.timestamp ASC"#,
+    )?;
+
+    let frames = stmt
+        .query_map(params![chunk_id], row_to_frame)?
+        .collect::<Result<Vec<_>, _>>()?;
+
+    Ok(frames)
+}
+
 /// Get count of frames that have OCR text
 pub fn get_ocr_count(conn: &Connection) -> Result<i64> {
     let count: i64 = conn.query_row(

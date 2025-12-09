@@ -6,11 +6,13 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::sync::RwLock;
+use tokio::sync::{broadcast, RwLock};
 use tracing::{debug, error, info, warn};
 
 use memoire_db::Database;
 use memoire_stt::{SttConfig, SttEngine};
+
+use crate::recorder::ChunkFinalizedEvent;
 
 /// Audio indexer batch settings
 const AUDIO_BATCH_SIZE: i64 = 5;
@@ -36,6 +38,7 @@ pub struct AudioIndexer {
     running: Arc<AtomicBool>,
     stats: Arc<RwLock<AudioIndexerStats>>,
     processed_count: Arc<AtomicU64>,
+    chunk_events_rx: Option<broadcast::Receiver<ChunkFinalizedEvent>>,
 }
 
 impl AudioIndexer {
@@ -75,10 +78,19 @@ impl AudioIndexer {
             stt_engine,
             data_dir,
             chunks_per_sec: DEFAULT_CHUNKS_PER_SEC,
-            running: Arc::new(AtomicBool::new(false)),
+            running: Arc::new(AtomicBool::new(true)), // Start as running
             stats: Arc::new(RwLock::new(stats)),
             processed_count: Arc::new(AtomicU64::new(0)),
+            chunk_events_rx: None, // Will be set via set_chunk_events_receiver()
         })
+    }
+
+    /// Set the chunk finalization event receiver
+    ///
+    /// This enables event-driven processing for immediate transcription of finalized audio chunks.
+    pub fn set_chunk_events_receiver(&mut self, rx: broadcast::Receiver<ChunkFinalizedEvent>) {
+        info!("Audio indexer now using event-driven chunk processing");
+        self.chunk_events_rx = Some(rx);
     }
 
     /// Get current statistics
@@ -92,37 +104,91 @@ impl AudioIndexer {
     }
 
     /// Run the indexer (blocks until stopped)
-    pub async fn run(&mut self) -> Result<()> {
-        info!("starting audio indexer at {} chunks/sec", self.chunks_per_sec);
+    pub async fn run(&mut self, shutdown: Arc<AtomicBool>) -> Result<()> {
+        info!("starting audio indexer");
         self.running.store(true, Ordering::Relaxed);
 
-        let chunk_interval = Duration::from_secs_f64(1.0 / self.chunks_per_sec);
-        let mut last_chunk_time = Instant::now();
+        let poll_interval = Duration::from_secs(30); // Poll every 30 seconds as fallback
         let mut batch_start = Instant::now();
         let mut batch_count = 0u64;
 
-        while self.running.load(Ordering::Relaxed) {
-            // Rate limiting
-            let elapsed = last_chunk_time.elapsed();
-            if elapsed < chunk_interval {
-                tokio::time::sleep(chunk_interval - elapsed).await;
-            }
-            last_chunk_time = Instant::now();
+        // Take ownership of the receiver if present
+        let mut chunk_rx = self.chunk_events_rx.take();
+        let use_events = chunk_rx.is_some();
 
-            // Process next batch of chunks
-            match self.process_batch().await {
-                Ok(count) => {
-                    if count > 0 {
-                        batch_count += count as u64;
-                        debug!("transcribed {} audio chunks", count);
-                    } else {
-                        // No chunks to process, sleep longer
-                        tokio::time::sleep(Duration::from_secs(5)).await;
+        if use_events {
+            info!("Audio indexer using event-driven mode with {} second fallback polling",
+                  poll_interval.as_secs());
+        } else {
+            info!("Audio indexer using polling mode every {} seconds",
+                  poll_interval.as_secs());
+        }
+
+        while !shutdown.load(Ordering::SeqCst) && self.running.load(Ordering::Relaxed) {
+            // Event-driven mode: wait for chunk events or timeout
+            if let Some(ref mut rx) = chunk_rx {
+                tokio::select! {
+                    // Branch 1: Chunk finalized event received
+                    event = rx.recv() => {
+                        match event {
+                            Ok(evt) => {
+                                debug!("received chunk finalized event for chunk {} (audio)",
+                                       evt.chunk_id);
+                                // Process audio chunks for this video chunk immediately
+                                // Note: Audio chunks are associated with video chunks for timing
+                                match self.process_batch().await {
+                                    Ok(count) if count > 0 => {
+                                        batch_count += count as u64;
+                                        info!("transcribed {} audio chunks (event-driven)",
+                                              count);
+                                    }
+                                    Ok(_) => {
+                                        debug!("no audio chunks pending for processing");
+                                    }
+                                    Err(e) => {
+                                        error!("error processing audio chunks: {}", e);
+                                    }
+                                }
+                            }
+                            Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                                warn!("audio indexer lagged, skipped {} chunk events", skipped);
+                            }
+                            Err(broadcast::error::RecvError::Closed) => {
+                                warn!("chunk event channel closed, switching to polling mode");
+                                chunk_rx = None;
+                            }
+                        }
+                    }
+
+                    // Branch 2: Timeout - poll for any missed chunks (fallback)
+                    _ = tokio::time::sleep(poll_interval) => {
+                        match self.process_batch().await {
+                            Ok(count) if count > 0 => {
+                                batch_count += count as u64;
+                                debug!("transcribed {} audio chunks via polling fallback", count);
+                            }
+                            Ok(_) => {} // No chunks pending
+                            Err(e) => {
+                                error!("polling batch processing error: {}", e);
+                            }
+                        }
                     }
                 }
-                Err(e) => {
-                    error!("batch processing error: {}", e);
-                    tokio::time::sleep(Duration::from_secs(5)).await;
+            } else {
+                // Polling-only mode (no event channel)
+                match self.process_batch().await {
+                    Ok(count) if count > 0 => {
+                        batch_count += count as u64;
+                        debug!("transcribed {} audio chunks via polling", count);
+                    }
+                    Ok(_) => {
+                        // No chunks, sleep before next poll
+                        tokio::time::sleep(poll_interval).await;
+                    }
+                    Err(e) => {
+                        error!("batch processing error: {}", e);
+                        tokio::time::sleep(Duration::from_secs(5)).await;
+                    }
                 }
             }
 
