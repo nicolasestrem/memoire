@@ -121,7 +121,12 @@ impl Processor {
             .get()
             .map_err(|e| OcrError::ConversionError(format!("failed to get decoder: {}", e)))?;
 
-        let bitmap = decoder.GetSoftwareBitmapAsync()
+        // Windows OCR requires Bgra8 pixel format with premultiplied alpha
+        // Using GetSoftwareBitmapConvertedAsync to ensure proper format
+        let bitmap = decoder.GetSoftwareBitmapConvertedAsync(
+            BitmapPixelFormat::Bgra8,
+            BitmapAlphaMode::Premultiplied,
+        )
             .map_err(|e| OcrError::ConversionError(format!("failed to get bitmap async: {}", e)))?
             .get()
             .map_err(|e| OcrError::ConversionError(format!("failed to get bitmap: {}", e)))?;

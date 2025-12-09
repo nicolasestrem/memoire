@@ -670,3 +670,12 @@ fn parse_datetime(row: &Row, idx: usize) -> rusqlite::Result<DateTime<Utc>> {
             Box::new(e),
         ))
 }
+
+/// Delete all OCR records with empty text (for re-indexing after bug fixes)
+pub fn delete_empty_ocr_records(conn: &Connection) -> Result<usize> {
+    let deleted = conn.execute(
+        "DELETE FROM ocr_text WHERE text = ''",
+        [],
+    )?;
+    Ok(deleted)
+}
