@@ -1,0 +1,32 @@
+[package]
+name = "memoire-stt"
+version.workspace = true
+edition.workspace = true
+description = "Speech-to-text for Memoire using Parakeet TDT via ONNX Runtime"
+
+[dependencies]
+# ONNX Runtime for model inference
+ort = { version = "2.0.0-rc.10", features = ["load-dynamic"] }
+
+# Audio loading
+hound.workspace = true
+
+# Resampling
+rubato.workspace = true
+
+# Error handling
+anyhow.workspace = true
+thiserror.workspace = true
+
+# Logging
+tracing.workspace = true
+
+# Serialization (for model config)
+serde.workspace = true
+serde_json.workspace = true
+
+# Async utilities
+tokio.workspace = true
+
+# Platform directories for model storage
+dirs = "5.0"

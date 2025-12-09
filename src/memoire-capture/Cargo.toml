@@ -11,3 +11,8 @@ anyhow.workspace = true
 thiserror.workspace = true
 image.workspace = true
 chrono.workspace = true
+
+# Audio capture
+wasapi.workspace = true
+hound.workspace = true
+rubato.workspace = true

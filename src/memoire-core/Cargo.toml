@@ -36,3 +36,4 @@ memoire-processing = { path = "../memoire-processing" }
 memoire-db = { path = "../memoire-db" }
 memoire-web = { path = "../memoire-web" }
 memoire-ocr = { path = "../memoire-ocr" }
+memoire-stt = { path = "../memoire-stt" }

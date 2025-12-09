@@ -14,6 +14,7 @@ mod recorder;
 mod config;
 mod tray;
 mod indexer;
+mod audio_indexer;
 
 use recorder::Recorder;
 use config::Config;
@@ -117,6 +118,35 @@ enum Commands {
         #[arg(short, long, default_value = "10")]
         limit: i64,
     },
+
+    /// List available audio devices
+    AudioDevices,
+
+    /// Record audio only (for testing audio capture)
+    RecordAudio {
+        /// Data directory for audio files
+        #[arg(short, long)]
+        data_dir: Option<PathBuf>,
+
+        /// Audio device ID (from audio-devices command)
+        #[arg(long)]
+        device: Option<String>,
+
+        /// Chunk duration in seconds
+        #[arg(long, default_value = "30")]
+        chunk_secs: u64,
+    },
+
+    /// Run audio transcription indexer
+    AudioIndex {
+        /// Data directory for videos and database
+        #[arg(short, long)]
+        data_dir: Option<PathBuf>,
+
+        /// Disable GPU acceleration
+        #[arg(long)]
+        no_gpu: bool,
+    },
 }
 
 fn main() -> Result<()> {
@@ -154,6 +184,15 @@ fn main() -> Result<()> {
         }
         Commands::Search { query, data_dir, limit } => {
             cmd_search(query, data_dir, limit)?;
+        }
+        Commands::AudioDevices => {
+            cmd_audio_devices()?;
+        }
+        Commands::RecordAudio { data_dir, device, chunk_secs } => {
+            cmd_record_audio(data_dir, device, chunk_secs)?;
+        }
+        Commands::AudioIndex { data_dir, no_gpu } => {
+            cmd_audio_index(data_dir, !no_gpu)?;
         }
     }
 
@@ -464,5 +503,180 @@ fn cmd_search(query: String, data_dir: Option<PathBuf>, limit: i64) -> Result<()
         println!();
     }
 
+    Ok(())
+}
+
+fn cmd_audio_devices() -> Result<()> {
+    println!("enumerating audio devices...\n");
+
+    let devices = memoire_capture::AudioCapture::enumerate_devices()?;
+
+    if devices.is_empty() {
+        println!("no audio devices found");
+        return Ok(());
+    }
+
+    println!("found {} audio device(s):\n", devices.len());
+
+    for device in &devices {
+        let default_marker = if device.is_default { " (default)" } else { "" };
+        let type_str = if device.is_input { "input" } else { "output" };
+
+        println!("  [{}] {}{}", type_str, device.name, default_marker);
+        println!("      ID: {}", device.id);
+        println!("      Channels: {}, Sample Rate: {} Hz, Bits: {}",
+            device.channels, device.sample_rate, device.bits_per_sample);
+        println!();
+    }
+
+    Ok(())
+}
+
+#[tokio::main]
+async fn cmd_record_audio(data_dir: Option<PathBuf>, device_id: Option<String>, chunk_secs: u64) -> Result<()> {
+    // Resolve data directory
+    let data_dir = data_dir.unwrap_or_else(|| {
+        dirs::data_local_dir()
+            .unwrap_or_else(|| PathBuf::from("."))
+            .join("Memoire")
+    });
+
+    // Create audio output directory
+    let audio_dir = data_dir.join("audio");
+    std::fs::create_dir_all(&audio_dir)?;
+
+    info!("starting audio capture");
+    info!("data directory: {:?}", data_dir);
+    info!("chunk duration: {} seconds", chunk_secs);
+
+    // Set up signal handler for graceful shutdown
+    let running = Arc::new(AtomicBool::new(true));
+    let r = running.clone();
+
+    ctrlc::set_handler(move || {
+        warn!("received shutdown signal, stopping audio capture...");
+        r.store(false, Ordering::Relaxed);
+    })?;
+
+    // Configure audio capture
+    let config = memoire_capture::AudioCaptureConfig {
+        device_id: device_id.clone(),
+        is_loopback: false,
+        target_sample_rate: 16000, // 16kHz for STT
+        target_channels: 1,        // mono for STT
+        chunk_duration_secs: chunk_secs as u32,
+    };
+
+    // Start audio capture
+    let mut capture = memoire_capture::AudioCapture::new(config)?;
+    let mut rx = capture.start()?;
+
+    info!("audio capture started, press Ctrl+C to stop");
+
+    // Open database for storing audio chunks
+    let db_path = data_dir.join("memoire.db");
+    let db = memoire_db::Database::open(&db_path)?;
+
+    // Create audio encoder
+    let encoder_config = memoire_processing::AudioEncoderConfig {
+        output_dir: audio_dir,
+        chunk_duration_secs: chunk_secs as u32,
+        sample_rate: 16000,
+        channels: 1,
+    };
+    let device_name_for_encoder = device_id.as_deref().unwrap_or("default");
+    let mut encoder = memoire_processing::AudioEncoder::new(encoder_config, device_name_for_encoder)?;
+
+    // Receive and process audio chunks
+    let mut chunk_count = 0;
+    while running.load(Ordering::Relaxed) {
+        match tokio::time::timeout(
+            std::time::Duration::from_millis(500),
+            rx.recv()
+        ).await {
+            Ok(Some(audio)) => {
+                chunk_count += 1;
+                info!("received audio chunk {}: {} samples, {:.1}s",
+                    chunk_count, audio.samples.len(), audio.duration_secs);
+
+                // Save to file using encoder
+                if let Some(file_path) = encoder.add_samples(&audio.samples, audio.timestamp)? {
+                    info!("saved audio chunk: {:?}", file_path);
+
+                    // Insert into database
+                    let new_chunk = memoire_db::NewAudioChunk {
+                        file_path: file_path.to_string_lossy().to_string(),
+                        device_name: Some(audio.device_name.clone()),
+                        is_input_device: Some(true),
+                    };
+                    memoire_db::insert_audio_chunk(db.connection(), &new_chunk)?;
+                }
+            }
+            Ok(None) => {
+                // Channel closed
+                break;
+            }
+            Err(_) => {
+                // Timeout - check if still running
+                continue;
+            }
+        }
+    }
+
+    // Finalize any remaining audio
+    if let Some(file_path) = encoder.finalize_chunk()? {
+        info!("saved final audio chunk: {:?}", file_path);
+
+        let new_chunk = memoire_db::NewAudioChunk {
+            file_path: file_path.to_string_lossy().to_string(),
+            device_name: None,
+            is_input_device: Some(true),
+        };
+        memoire_db::insert_audio_chunk(db.connection(), &new_chunk)?;
+    }
+
+    capture.stop();
+    info!("audio capture stopped, {} chunks recorded", chunk_count);
+
+    Ok(())
+}
+
+#[tokio::main]
+async fn cmd_audio_index(data_dir: Option<PathBuf>, use_gpu: bool) -> Result<()> {
+    // Resolve data directory
+    let data_dir = data_dir.unwrap_or_else(|| {
+        dirs::data_local_dir()
+            .unwrap_or_else(|| PathBuf::from("."))
+            .join("Memoire")
+    });
+
+    let db_path = data_dir.join("memoire.db");
+
+    if !db_path.exists() {
+        error!("database not found at {:?}", db_path);
+        error!("please run 'memoire record' first to initialize the database");
+        return Err(anyhow::anyhow!("database not found"));
+    }
+
+    info!("starting audio transcription indexer");
+    info!("data directory: {:?}", data_dir);
+    info!("GPU enabled: {}", use_gpu);
+
+    // Create indexer
+    let mut indexer = audio_indexer::AudioIndexer::new(data_dir, use_gpu)?;
+
+    // Set up signal handler for graceful shutdown
+    let running = Arc::new(AtomicBool::new(true));
+    let r = running.clone();
+
+    ctrlc::set_handler(move || {
+        warn!("received shutdown signal, stopping audio indexer...");
+        r.store(false, Ordering::Relaxed);
+    })?;
+
+    // Run indexer until Ctrl+C
+    indexer.run().await?;
+
+    info!("audio indexer stopped");
     Ok(())
 }
