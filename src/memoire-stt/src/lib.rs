@@ -3,9 +3,11 @@
 //! Provides speech-to-text transcription using Parakeet TDT via ONNX Runtime.
 //! Supports GPU acceleration via CUDA with CPU fallback.
 
+mod download;
 mod engine;
 mod error;
 
+pub use download::ModelDownloader;
 pub use engine::{SttEngine, SttConfig, TranscriptionResult, TranscriptionSegment};
 pub use error::SttError;
 

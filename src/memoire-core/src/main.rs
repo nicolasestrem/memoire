@@ -147,6 +147,17 @@ enum Commands {
         #[arg(long)]
         no_gpu: bool,
     },
+
+    /// Download Parakeet TDT speech-to-text models
+    DownloadModels {
+        /// Data directory for models
+        #[arg(short, long)]
+        data_dir: Option<PathBuf>,
+
+        /// Force re-download even if models exist
+        #[arg(long)]
+        force: bool,
+    },
 }
 
 fn main() -> Result<()> {
@@ -193,6 +204,9 @@ fn main() -> Result<()> {
         }
         Commands::AudioIndex { data_dir, no_gpu } => {
             cmd_audio_index(data_dir, !no_gpu)?;
+        }
+        Commands::DownloadModels { data_dir, force } => {
+            cmd_download_models(data_dir, force)?;
         }
     }
 
@@ -678,5 +692,38 @@ async fn cmd_audio_index(data_dir: Option<PathBuf>, use_gpu: bool) -> Result<()>
     indexer.run().await?;
 
     info!("audio indexer stopped");
+    Ok(())
+}
+
+#[tokio::main]
+async fn cmd_download_models(data_dir: Option<PathBuf>, force: bool) -> Result<()> {
+    // Resolve model directory
+    let model_dir = data_dir
+        .map(|d| d.join("models"))
+        .unwrap_or_else(memoire_stt::default_model_dir);
+
+    info!("model directory: {:?}", model_dir);
+
+    // Create downloader
+    let downloader = memoire_stt::ModelDownloader::new(model_dir.clone());
+
+    // Check if models already exist
+    if !force && downloader.is_complete() {
+        println!("All models already downloaded at {:?}", model_dir);
+        println!("Use --force to re-download");
+        return Ok(());
+    }
+
+    // Show what's missing
+    let missing = downloader.missing_files();
+    if !missing.is_empty() && !force {
+        println!("Missing model files: {:?}", missing);
+    }
+
+    // Download models
+    println!("Downloading Parakeet TDT models (~630 MB total)...\n");
+    downloader.download_all(force).await?;
+
+    println!("\nDownload complete! You can now run 'memoire audio-index' to transcribe audio.");
     Ok(())
 }
