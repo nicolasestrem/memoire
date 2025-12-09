@@ -92,6 +92,29 @@
             </div>
         </section>
 
+        <section class="ocr-section">
+            <h2>OCR Text</h2>
+            <div id="ocr-stats" class="ocr-stats">
+                <div class="stats-label">OCR Processing</div>
+                <div class="stats-bar">
+                    <div id="ocr-progress" class="stats-progress" style="width: 0%"></div>
+                </div>
+                <div id="ocr-stats-text" class="stats-text">Loading...</div>
+            </div>
+            <div id="ocr-text" class="ocr-text">
+                <div class="ocr-placeholder">Select a frame to view OCR text</div>
+            </div>
+        </section>
+
+        <section class="search-section">
+            <h2>Search OCR Text</h2>
+            <div class="search-controls">
+                <input type="text" id="search-input" placeholder="Search for text in OCR data..." />
+                <button id="search-btn" class="btn">Search</button>
+            </div>
+            <div id="search-results" class="search-results"></div>
+        </section>
+
         <section class="validation">
             <h2>Validation Checks</h2>
             <ul id="validation-results" class="validation-list">

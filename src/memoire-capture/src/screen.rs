@@ -39,6 +39,74 @@ impl CapturedFrame {
         img.save(path)?;
         Ok(())
     }
+
+    /// Compute a 64-bit perceptual hash (average hash) for deduplication.
+    /// Downsamples the image to 8x8, converts to grayscale, and compares
+    /// each pixel to the mean brightness to produce a 64-bit fingerprint.
+    pub fn compute_perceptual_hash(&self) -> u64 {
+        const HASH_SIZE: usize = 8;
+
+        // Calculate block sizes
+        let block_w = self.width as usize / HASH_SIZE;
+        let block_h = self.height as usize / HASH_SIZE;
+
+        if block_w == 0 || block_h == 0 {
+            // Image too small, return hash of raw data
+            return self.data.iter().fold(0u64, |acc, &b| acc.wrapping_add(b as u64));
+        }
+
+        // Compute average grayscale value for each 8x8 block
+        let mut block_values = [0u64; HASH_SIZE * HASH_SIZE];
+
+        for by in 0..HASH_SIZE {
+            for bx in 0..HASH_SIZE {
+                let mut sum = 0u64;
+                let mut count = 0u32;
+
+                // Sample pixels in this block
+                let start_y = by * block_h;
+                let start_x = bx * block_w;
+                let end_y = std::cmp::min(start_y + block_h, self.height as usize);
+                let end_x = std::cmp::min(start_x + block_w, self.width as usize);
+
+                for y in start_y..end_y {
+                    for x in start_x..end_x {
+                        let idx = (y * self.width as usize + x) * 4;
+                        if idx + 2 < self.data.len() {
+                            // Convert RGB to grayscale using luminance formula
+                            let r = self.data[idx] as u64;
+                            let g = self.data[idx + 1] as u64;
+                            let b = self.data[idx + 2] as u64;
+                            sum += (r * 299 + g * 587 + b * 114) / 1000;
+                            count += 1;
+                        }
+                    }
+                }
+
+                block_values[by * HASH_SIZE + bx] = if count > 0 { sum / count as u64 } else { 0 };
+            }
+        }
+
+        // Calculate mean of all blocks
+        let total: u64 = block_values.iter().sum();
+        let mean = total / (HASH_SIZE * HASH_SIZE) as u64;
+
+        // Build hash: 1 if above mean, 0 if below
+        let mut hash = 0u64;
+        for (i, &value) in block_values.iter().enumerate() {
+            if value >= mean {
+                hash |= 1u64 << i;
+            }
+        }
+
+        hash
+    }
+
+    /// Calculate the Hamming distance between two hashes (number of differing bits).
+    /// A distance of 0 means identical, lower values mean more similar frames.
+    pub fn hash_distance(hash1: u64, hash2: u64) -> u32 {
+        (hash1 ^ hash2).count_ones()
+    }
 }
 
 /// Screen capture using DXGI Desktop Duplication API

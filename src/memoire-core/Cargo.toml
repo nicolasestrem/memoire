@@ -28,7 +28,11 @@ dirs = "5.0"
 tray-icon.workspace = true
 tao.workspace = true
 
+# Async utilities
+futures.workspace = true
+
 memoire-capture = { path = "../memoire-capture" }
 memoire-processing = { path = "../memoire-processing" }
 memoire-db = { path = "../memoire-db" }
 memoire-web = { path = "../memoire-web" }
+memoire-ocr = { path = "../memoire-ocr" }

@@ -13,10 +13,12 @@ use tracing_subscriber::FmtSubscriber;
 mod recorder;
 mod config;
 mod tray;
+mod indexer;
 
 use recorder::Recorder;
 use config::Config;
 use tray::TrayApp;
+use indexer::Indexer;
 
 #[derive(Parser)]
 #[command(name = "memoire")]
@@ -86,6 +88,35 @@ enum Commands {
         #[arg(short, long, default_value = "8080")]
         port: u16,
     },
+
+    /// Run OCR indexer on captured frames
+    Index {
+        /// Data directory for videos and database
+        #[arg(short, long)]
+        data_dir: Option<PathBuf>,
+
+        /// OCR processing rate (frames per second)
+        #[arg(long, default_value = "10")]
+        ocr_fps: u32,
+
+        /// OCR language (BCP47 tag, e.g., "en-US", "fr-FR", "de-DE", "ja-JP")
+        #[arg(long)]
+        ocr_language: Option<String>,
+    },
+
+    /// Search OCR text
+    Search {
+        /// Search query
+        query: String,
+
+        /// Data directory for videos and database
+        #[arg(short, long)]
+        data_dir: Option<PathBuf>,
+
+        /// Maximum number of results
+        #[arg(short, long, default_value = "10")]
+        limit: i64,
+    },
 }
 
 fn main() -> Result<()> {
@@ -117,6 +148,12 @@ fn main() -> Result<()> {
         }
         Commands::Viewer { data_dir, port } => {
             cmd_viewer(data_dir, port)?;
+        }
+        Commands::Index { data_dir, ocr_fps, ocr_language } => {
+            cmd_index(data_dir, ocr_fps, ocr_language)?;
+        }
+        Commands::Search { query, data_dir, limit } => {
+            cmd_search(query, data_dir, limit)?;
         }
     }
 
@@ -218,10 +255,18 @@ fn cmd_status() -> Result<()> {
 
     let db = memoire_db::Database::open(&db_path)?;
     let frame_count = memoire_db::get_frame_count(db.connection())?;
+    let ocr_count = memoire_db::get_ocr_count(db.connection())?;
 
     println!("status: ready");
     println!("database: {:?}", db_path);
     println!("total frames: {}", frame_count);
+    println!("frames with OCR: {}", ocr_count);
+
+    if frame_count > 0 {
+        let percentage = (ocr_count as f64 / frame_count as f64) * 100.0;
+        let pending = frame_count - ocr_count;
+        println!("OCR progress: {:.1}% ({} pending)", percentage, pending);
+    }
 
     // Get latest chunk
     if let Some(chunk) = memoire_db::get_latest_video_chunk(db.connection())? {
@@ -315,6 +360,109 @@ async fn cmd_viewer(data_dir: Option<PathBuf>, port: u16) -> Result<()> {
 
     // Start web server
     memoire_web::serve(connection, data_dir, port).await?;
+
+    Ok(())
+}
+
+#[tokio::main]
+async fn cmd_index(data_dir: Option<PathBuf>, ocr_fps: u32, ocr_language: Option<String>) -> Result<()> {
+    // Resolve data directory
+    let data_dir = data_dir.unwrap_or_else(|| {
+        dirs::data_local_dir()
+            .unwrap_or_else(|| PathBuf::from("."))
+            .join("Memoire")
+    });
+
+    let db_path = data_dir.join("memoire.db");
+
+    if !db_path.exists() {
+        error!("database not found at {:?}", db_path);
+        error!("please run 'memoire record' first to initialize the database");
+        return Err(anyhow::anyhow!("database not found"));
+    }
+
+    info!("starting OCR indexer");
+    info!("data directory: {:?}", data_dir);
+    info!("OCR rate: {} fps", ocr_fps);
+    if let Some(ref lang) = ocr_language {
+        info!("OCR language: {}", lang);
+    } else {
+        info!("OCR language: en-US (default)");
+    }
+
+    // Create indexer
+    let mut indexer = Indexer::new(data_dir, Some(ocr_fps), ocr_language)?;
+
+    // Set up signal handler for graceful shutdown
+    let running = Arc::new(AtomicBool::new(true));
+    let r = running.clone();
+
+    ctrlc::set_handler(move || {
+        warn!("received shutdown signal, stopping indexer...");
+        r.store(false, Ordering::Relaxed);
+    })?;
+
+    // Run indexer until Ctrl+C
+    indexer.run().await?;
+
+    info!("indexer stopped");
+    Ok(())
+}
+
+fn cmd_search(query: String, data_dir: Option<PathBuf>, limit: i64) -> Result<()> {
+    // Resolve data directory
+    let data_dir = data_dir.unwrap_or_else(|| {
+        dirs::data_local_dir()
+            .unwrap_or_else(|| PathBuf::from("."))
+            .join("Memoire")
+    });
+
+    let db_path = data_dir.join("memoire.db");
+
+    if !db_path.exists() {
+        error!("database not found at {:?}", db_path);
+        error!("please run 'memoire record' first to initialize the database");
+        return Err(anyhow::anyhow!("database not found"));
+    }
+
+    info!("searching for: '{}'", query);
+
+    // Open database
+    let db = memoire_db::Database::open(&db_path)?;
+
+    // Perform search
+    let results = memoire_db::search_ocr(db.connection(), &query, limit, 0)?;
+
+    if results.is_empty() {
+        println!("no results found for query: '{}'", query);
+        return Ok(());
+    }
+
+    println!("found {} result(s):\n", results.len());
+
+    for (i, (ocr, frame)) in results.iter().enumerate() {
+        println!("{}. Frame ID: {}", i + 1, frame.id);
+        println!("   Timestamp: {}", frame.timestamp);
+
+        // Get video chunk for device name
+        if let Ok(Some(chunk)) = memoire_db::get_video_chunk(db.connection(), frame.video_chunk_id) {
+            println!("   Device: {}", chunk.device_name);
+        }
+
+        // Show snippet of text (first 150 chars)
+        let snippet = if ocr.text.len() > 150 {
+            format!("{}...", &ocr.text[..150])
+        } else {
+            ocr.text.clone()
+        };
+        println!("   Text: {}", snippet.replace('\n', " "));
+
+        if let Some(conf) = ocr.confidence {
+            println!("   Confidence: {:.2}%", conf * 100.0);
+        }
+
+        println!();
+    }
 
     Ok(())
 }

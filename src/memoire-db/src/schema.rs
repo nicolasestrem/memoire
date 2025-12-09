@@ -10,6 +10,8 @@ pub struct VideoChunk {
     pub file_path: String,
     pub device_name: String,
     pub created_at: DateTime<Utc>,
+    pub width: Option<u32>,
+    pub height: Option<u32>,
 }
 
 /// Frame metadata within a video chunk
@@ -23,6 +25,7 @@ pub struct Frame {
     pub window_name: Option<String>,
     pub browser_url: Option<String>,
     pub focused: bool,
+    pub frame_hash: Option<i64>,
 }
 
 /// OCR extracted text from a frame
@@ -62,6 +65,8 @@ pub struct AudioTranscription {
 pub struct NewVideoChunk {
     pub file_path: String,
     pub device_name: String,
+    pub width: Option<u32>,
+    pub height: Option<u32>,
 }
 
 /// New frame to insert
@@ -74,6 +79,7 @@ pub struct NewFrame {
     pub window_name: Option<String>,
     pub browser_url: Option<String>,
     pub focused: bool,
+    pub frame_hash: Option<i64>,
 }
 
 /// New OCR text to insert
@@ -93,6 +99,8 @@ pub struct ChunkWithFrameCount {
     pub device_name: String,
     pub created_at: DateTime<Utc>,
     pub frame_count: i64,
+    pub width: Option<u32>,
+    pub height: Option<u32>,
 }
 
 /// Monitor statistics summary
@@ -102,4 +110,29 @@ pub struct MonitorSummary {
     pub total_chunks: i64,
     pub total_frames: i64,
     pub latest_capture: Option<DateTime<Utc>>,
+}
+
+/// Frame with optional OCR text (from LEFT JOIN)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FrameWithOcr {
+    pub id: i64,
+    pub video_chunk_id: i64,
+    pub offset_index: i64,
+    pub timestamp: DateTime<Utc>,
+    pub app_name: Option<String>,
+    pub window_name: Option<String>,
+    pub browser_url: Option<String>,
+    pub focused: bool,
+    pub frame_hash: Option<i64>,
+    pub ocr_text: Option<OcrText>,
+}
+
+/// OCR indexing statistics
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OcrStats {
+    pub total_frames: i64,
+    pub frames_with_ocr: i64,
+    pub pending_frames: i64,
+    pub processing_rate: i64,
+    pub last_updated: Option<DateTime<Utc>>,
 }

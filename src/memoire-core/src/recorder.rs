@@ -7,7 +7,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tracing::{debug, error, info, warn};
 
-use memoire_capture::{Monitor, MonitorInfo, ScreenCapture};
+use memoire_capture::{Monitor, MonitorInfo, ScreenCapture, screen::CapturedFrame};
 use memoire_db::{Database, NewFrame, NewVideoChunk};
 use memoire_processing::{VideoEncoder, encoder::EncoderConfig};
 
@@ -16,6 +16,11 @@ use crate::config::Config;
 /// Frame batch settings for database writes
 const FRAME_BATCH_SIZE: usize = 30;
 const FRAME_FLUSH_INTERVAL: Duration = Duration::from_secs(5);
+
+/// Frame deduplication settings
+/// Hamming distance threshold: frames with distance <= this are considered duplicates
+/// 0 = exact match only, 5 = ~92% similar, 10 = ~85% similar
+const DEFAULT_DEDUP_THRESHOLD: u32 = 5;
 
 /// Per-monitor recording state
 struct MonitorRecorder {
@@ -28,6 +33,10 @@ struct MonitorRecorder {
     consecutive_errors: u32,
     pending_frames: Vec<NewFrame>,
     last_db_flush: Instant,
+    /// Last frame's perceptual hash for deduplication
+    last_frame_hash: Option<u64>,
+    /// Counter for skipped duplicate frames
+    skipped_frames: u64,
 }
 
 impl MonitorRecorder {
@@ -64,6 +73,8 @@ impl MonitorRecorder {
             consecutive_errors: 0,
             pending_frames: Vec::with_capacity(FRAME_BATCH_SIZE),
             last_db_flush: Instant::now(),
+            last_frame_hash: None,
+            skipped_frames: 0,
         })
     }
 
@@ -72,6 +83,26 @@ impl MonitorRecorder {
             Some(f) => f,
             None => return Ok(false),
         };
+
+        // Calculate perceptual hash for deduplication
+        let frame_hash = frame.compute_perceptual_hash();
+
+        // Check for duplicate frame using Hamming distance
+        if let Some(last_hash) = self.last_frame_hash {
+            let distance = CapturedFrame::hash_distance(frame_hash, last_hash);
+            if distance <= DEFAULT_DEDUP_THRESHOLD {
+                // Frame is too similar to previous, skip it
+                self.skipped_frames += 1;
+                debug!(
+                    "skipping duplicate frame (distance={}, threshold={}), total skipped: {}",
+                    distance, DEFAULT_DEDUP_THRESHOLD, self.skipped_frames
+                );
+                return Ok(false);
+            }
+        }
+
+        // Update last frame hash
+        self.last_frame_hash = Some(frame_hash);
 
         // Ensure we have a current chunk
         if self.current_chunk_id.is_none() {
@@ -89,7 +120,7 @@ impl MonitorRecorder {
             }
         };
 
-        // Buffer frame metadata for batch insert
+        // Buffer frame metadata for batch insert (store hash as i64 for SQLite)
         let new_frame = NewFrame {
             video_chunk_id: chunk_id,
             offset_index: self.frame_index,
@@ -98,6 +129,7 @@ impl MonitorRecorder {
             window_name: None,
             browser_url: None,
             focused: true,
+            frame_hash: Some(frame_hash as i64),
         };
         self.pending_frames.push(new_frame);
 
@@ -148,6 +180,8 @@ impl MonitorRecorder {
         let new_chunk = NewVideoChunk {
             file_path,
             device_name: self.info.name.clone(),
+            width: Some(self.info.width),
+            height: Some(self.info.height),
         };
 
         let chunk_id = memoire_db::insert_video_chunk(db.connection(), &new_chunk)?;
@@ -285,20 +319,34 @@ impl Recorder {
             if any_captured {
                 total_frames += 1;
                 if total_frames % 60 == 0 {
-                    info!("captured {} frame sets across {} monitors", total_frames, self.monitors.len());
+                    let total_skipped: u64 = self.monitors.iter().map(|m| m.skipped_frames).sum();
+                    info!(
+                        "captured {} frame sets across {} monitors (skipped {} duplicate frames)",
+                        total_frames, self.monitors.len(), total_skipped
+                    );
                 }
             }
         }
 
         // Finalize all chunks
         info!("finalizing recording...");
+        let mut total_skipped = 0u64;
         for monitor in &mut self.monitors {
+            total_skipped += monitor.skipped_frames;
             if let Err(e) = monitor.finalize_chunk(&self.db) {
                 warn!("error finalizing chunk for {}: {}", monitor.info.name, e);
             }
         }
 
-        info!("recording stopped. total frame sets: {}", total_frames);
+        let dedup_percentage = if total_frames + total_skipped > 0 {
+            (total_skipped as f64 / (total_frames + total_skipped) as f64) * 100.0
+        } else {
+            0.0
+        };
+        info!(
+            "recording stopped. total frames: {}, skipped duplicates: {} ({:.1}% reduction)",
+            total_frames, total_skipped, dedup_percentage
+        );
         Ok(())
     }
 
