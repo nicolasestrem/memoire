@@ -785,24 +785,5 @@ async fn cmd_download_models(data_dir: Option<PathBuf>, force: bool) -> Result<(
     downloader.download_all(force).await?;
 
     println!("\nDownload complete! You can now run 'memoire audio-index' to transcribe audio.");
-=======
-        return Err(anyhow::anyhow!("database not found"));
-    }
-
-    let db = memoire_db::Database::open(&db_path)?;
-
-    if clear_all {
-        // Clear ALL OCR records
-        let deleted = db.connection().execute("DELETE FROM ocr_text", [])?;
-        info!("deleted {} OCR record(s)", deleted);
-        println!("cleared {} OCR record(s)", deleted);
-    } else {
-        // Only clear empty OCR records
-        let deleted = memoire_db::delete_empty_ocr_records(db.connection())?;
-        info!("deleted {} empty OCR record(s)", deleted);
-        println!("cleared {} empty OCR record(s)", deleted);
-    }
-
-    println!("run 'memoire index' to re-process frames");
     Ok(())
 }
