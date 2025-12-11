@@ -14,6 +14,10 @@ mod recorder;
 mod config;
 mod tray;
 mod indexer;
+mod audio_indexer;
+mod test_config;
+mod orchestrator;
+mod colored_logger;
 
 use recorder::Recorder;
 use config::Config;
@@ -128,18 +132,79 @@ enum Commands {
         #[arg(long)]
         all: bool,
     },
+
+    /// List available audio devices
+    AudioDevices,
+
+    /// Record audio only (for testing audio capture)
+    RecordAudio {
+        /// Data directory for audio files
+        #[arg(short, long)]
+        data_dir: Option<PathBuf>,
+
+        /// Audio device ID (from audio-devices command)
+        #[arg(long)]
+        device: Option<String>,
+
+        /// Chunk duration in seconds
+        #[arg(long, default_value = "30")]
+        chunk_secs: u64,
+
+        /// Enable loopback mode (capture system audio instead of microphone)
+        #[arg(long)]
+        loopback: bool,
+    },
+
+    /// Run audio transcription indexer
+    AudioIndex {
+        /// Data directory for videos and database
+        #[arg(short, long)]
+        data_dir: Option<PathBuf>,
+
+        /// Disable GPU acceleration
+        #[arg(long)]
+        no_gpu: bool,
+    },
+
+    /// Download Parakeet TDT speech-to-text models
+    DownloadModels {
+        /// Data directory for models
+        #[arg(short, long)]
+        data_dir: Option<PathBuf>,
+
+        /// Force re-download even if models exist
+        #[arg(long)]
+        force: bool,
+    },
+
+    /// Run all components for testing (record + index + audio-index + viewer)
+    TestAll {
+        /// Path to test configuration file
+        #[arg(long, default_value = "test-config.toml")]
+        config: PathBuf,
+
+        /// Profile to use from config file (e.g., "quick", "full")
+        #[arg(long)]
+        profile: Option<String>,
+
+        /// Override data directory
+        #[arg(long)]
+        data_dir: Option<PathBuf>,
+    },
 }
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
 
-    // Initialize logging
-    let level = if cli.verbose { Level::DEBUG } else { Level::INFO };
-    FmtSubscriber::builder()
-        .with_max_level(level)
-        .with_target(false)
-        .compact()
-        .init();
+    // Initialize logging (skip for test-all which uses colored logger)
+    if !matches!(cli.command, Commands::TestAll { .. }) {
+        let level = if cli.verbose { Level::DEBUG } else { Level::INFO };
+        FmtSubscriber::builder()
+            .with_max_level(level)
+            .with_target(false)
+            .compact()
+            .init();
+    }
 
     match cli.command {
         Commands::Record { data_dir, fps, no_hw } => {
@@ -168,6 +233,21 @@ fn main() -> Result<()> {
         }
         Commands::ResetOcr { data_dir, all } => {
             cmd_reset_ocr(data_dir, all)?;
+        }
+        Commands::AudioDevices => {
+            cmd_audio_devices()?;
+        }
+        Commands::RecordAudio { data_dir, device, chunk_secs, loopback } => {
+            cmd_record_audio(data_dir, device, chunk_secs, loopback)?;
+        }
+        Commands::AudioIndex { data_dir, no_gpu } => {
+            cmd_audio_index(data_dir, !no_gpu)?;
+        }
+        Commands::DownloadModels { data_dir, force } => {
+            cmd_download_models(data_dir, force)?;
+        }
+        Commands::TestAll { config, profile, data_dir } => {
+            cmd_test_all(config, profile, data_dir)?;
         }
     }
 
@@ -408,16 +488,16 @@ async fn cmd_index(data_dir: Option<PathBuf>, ocr_fps: u32, ocr_language: Option
     let mut indexer = Indexer::new(data_dir, Some(ocr_fps), ocr_language)?;
 
     // Set up signal handler for graceful shutdown
-    let running = Arc::new(AtomicBool::new(true));
-    let r = running.clone();
+    let shutdown = Arc::new(AtomicBool::new(false));
+    let shutdown_handler = shutdown.clone();
 
     ctrlc::set_handler(move || {
         warn!("received shutdown signal, stopping indexer...");
-        r.store(false, Ordering::Relaxed);
+        shutdown_handler.store(true, Ordering::Relaxed);
     })?;
 
     // Run indexer until Ctrl+C
-    indexer.run().await?;
+    indexer.run(shutdown).await?;
 
     info!("indexer stopped");
     Ok(())
@@ -490,26 +570,282 @@ fn cmd_reset_ocr(data_dir: Option<PathBuf>, clear_all: bool) -> Result<()> {
     });
 
     let db_path = data_dir.join("memoire.db");
-
-    if !db_path.exists() {
-        error!("database not found at {:?}", db_path);
-        return Err(anyhow::anyhow!("database not found"));
-    }
-
     let db = memoire_db::Database::open(&db_path)?;
 
     if clear_all {
-        // Clear ALL OCR records
-        let deleted = db.connection().execute("DELETE FROM ocr_text", [])?;
-        info!("deleted {} OCR record(s)", deleted);
-        println!("cleared {} OCR record(s)", deleted);
+        println!("clearing ALL OCR records...");
+        memoire_db::reset_all_ocr(db.connection())?;
+        println!("✓ all OCR records cleared");
     } else {
-        // Only clear empty OCR records
-        let deleted = memoire_db::delete_empty_ocr_records(db.connection())?;
-        info!("deleted {} empty OCR record(s)", deleted);
-        println!("cleared {} empty OCR record(s)", deleted);
+        println!("clearing empty OCR records...");
+        let deleted = memoire_db::reset_empty_ocr(db.connection())?;
+        println!("✓ cleared {} empty OCR records", deleted);
     }
 
-    println!("run 'memoire index' to re-process frames");
     Ok(())
+}
+
+fn cmd_audio_devices() -> Result<()> {
+    println!("enumerating audio devices...\n");
+
+    let devices = memoire_capture::AudioCapture::enumerate_devices()?;
+
+    if devices.is_empty() {
+        println!("no audio devices found");
+        return Ok(());
+    }
+
+    println!("found {} audio device(s):\n", devices.len());
+
+    for device in &devices {
+        let default_marker = if device.is_default { " (default)" } else { "" };
+        let type_str = if device.is_input { "input" } else { "output" };
+
+        println!("  [{}] {}{}", type_str, device.name, default_marker);
+        println!("      ID: {}", device.id);
+        println!("      Channels: {}, Sample Rate: {} Hz, Bits: {}",
+            device.channels, device.sample_rate, device.bits_per_sample);
+        println!();
+    }
+
+    Ok(())
+}
+
+#[tokio::main]
+async fn cmd_record_audio(data_dir: Option<PathBuf>, device_id: Option<String>, chunk_secs: u64, loopback: bool) -> Result<()> {
+    // Resolve data directory
+    let data_dir = data_dir.unwrap_or_else(|| {
+        dirs::data_local_dir()
+            .unwrap_or_else(|| PathBuf::from("."))
+            .join("Memoire")
+    });
+
+    // Create audio output directory
+    let audio_dir = data_dir.join("audio");
+    std::fs::create_dir_all(&audio_dir)?;
+
+    info!("starting audio capture (loopback={})", loopback);
+    info!("data directory: {:?}", data_dir);
+    info!("chunk duration: {} seconds", chunk_secs);
+
+    // Set up signal handler for graceful shutdown
+    let running = Arc::new(AtomicBool::new(true));
+    let r = running.clone();
+
+    ctrlc::set_handler(move || {
+        warn!("received shutdown signal, stopping audio capture...");
+        r.store(false, Ordering::Relaxed);
+    })?;
+
+    // Configure audio capture
+    let config = memoire_capture::AudioCaptureConfig {
+        device_id: device_id.clone(),
+        is_loopback: loopback,
+        target_sample_rate: 16000, // 16kHz for STT
+        target_channels: 1,        // mono for STT
+        chunk_duration_secs: chunk_secs as u32,
+    };
+
+    // Start audio capture
+    let mut capture = memoire_capture::AudioCapture::new(config)?;
+    let mut rx = capture.start()?;
+
+    info!("audio capture started, press Ctrl+C to stop");
+
+    // Open database for storing audio chunks
+    let db_path = data_dir.join("memoire.db");
+    let db = memoire_db::Database::open(&db_path)?;
+
+    // Create audio encoder
+    let encoder_config = memoire_processing::AudioEncoderConfig {
+        output_dir: audio_dir,
+        chunk_duration_secs: chunk_secs as u32,
+        sample_rate: 16000,
+        channels: 1,
+    };
+    let device_name_for_encoder = device_id.as_deref().unwrap_or("default");
+    let mut encoder = memoire_processing::AudioEncoder::new(encoder_config, device_name_for_encoder)?;
+
+    // Receive and process audio chunks
+    let mut chunk_count = 0;
+    while running.load(Ordering::Relaxed) {
+        match tokio::time::timeout(
+            std::time::Duration::from_millis(500),
+            rx.recv()
+        ).await {
+            Ok(Some(audio)) => {
+                chunk_count += 1;
+                info!("received audio chunk {}: {} samples, {:.1}s",
+                    chunk_count, audio.samples.len(), audio.duration_secs);
+
+                // Save to file using encoder
+                if let Some(file_path) = encoder.add_samples(&audio.samples, audio.timestamp)? {
+                    info!("saved audio chunk: {:?}", file_path);
+
+                    // Insert into database
+                    let new_chunk = memoire_db::NewAudioChunk {
+                        file_path: file_path.to_string_lossy().to_string(),
+                        device_name: Some(audio.device_name.clone()),
+                        is_input_device: Some(true),
+                    };
+                    memoire_db::insert_audio_chunk(db.connection(), &new_chunk)?;
+                }
+            }
+            Ok(None) => {
+                // Channel closed
+                break;
+            }
+            Err(_) => {
+                // Timeout - check if still running
+                continue;
+            }
+        }
+    }
+
+    // Finalize any remaining audio
+    if let Some(file_path) = encoder.finalize_chunk()? {
+        info!("saved final audio chunk: {:?}", file_path);
+
+        let new_chunk = memoire_db::NewAudioChunk {
+            file_path: file_path.to_string_lossy().to_string(),
+            device_name: None,
+            is_input_device: Some(true),
+        };
+        memoire_db::insert_audio_chunk(db.connection(), &new_chunk)?;
+    }
+
+    capture.stop();
+    info!("audio capture stopped, {} chunks recorded", chunk_count);
+
+    Ok(())
+}
+
+#[tokio::main]
+async fn cmd_audio_index(data_dir: Option<PathBuf>, use_gpu: bool) -> Result<()> {
+    // Resolve data directory
+    let data_dir = data_dir.unwrap_or_else(|| {
+        dirs::data_local_dir()
+            .unwrap_or_else(|| PathBuf::from("."))
+            .join("Memoire")
+    });
+
+    let db_path = data_dir.join("memoire.db");
+
+    if !db_path.exists() {
+        error!("database not found at {:?}", db_path);
+        error!("please run 'memoire record' first to initialize the database");
+        return Err(anyhow::anyhow!("database not found"));
+    }
+
+    info!("starting audio transcription indexer");
+    info!("data directory: {:?}", data_dir);
+    info!("GPU enabled: {}", use_gpu);
+
+    // Configure ONNX Runtime to use bundled DLL (required for ort 2.0.0-rc.10)
+    // This must be done BEFORE creating the STT engine
+    let model_dir = data_dir.join("models");
+    if memoire_stt::has_bundled_onnx_runtime(&model_dir) {
+        memoire_stt::configure_onnx_runtime(&model_dir)?;
+    } else {
+        warn!("bundled ONNX Runtime not found, using system DLL");
+        warn!("if you get version errors, run 'memoire download-models' first");
+    }
+
+    // Create indexer
+    let mut indexer = audio_indexer::AudioIndexer::new(data_dir, use_gpu)?;
+
+    // Set up signal handler for graceful shutdown
+    let shutdown = Arc::new(AtomicBool::new(false));
+    let shutdown_handler = shutdown.clone();
+
+    ctrlc::set_handler(move || {
+        warn!("received shutdown signal, stopping audio indexer...");
+        shutdown_handler.store(true, Ordering::Relaxed);
+    })?;
+
+    // Run indexer until Ctrl+C
+    indexer.run(shutdown).await?;
+
+    info!("audio indexer stopped");
+    Ok(())
+}
+
+#[tokio::main]
+async fn cmd_download_models(data_dir: Option<PathBuf>, force: bool) -> Result<()> {
+    // Resolve model directory
+    let model_dir = data_dir
+        .map(|d| d.join("models"))
+        .unwrap_or_else(memoire_stt::default_model_dir);
+
+    info!("model directory: {:?}", model_dir);
+
+    // Create downloader
+    let downloader = memoire_stt::ModelDownloader::new(model_dir.clone());
+
+    // Check if everything already exists
+    if !force && downloader.is_fully_complete() {
+        println!("All models and ONNX Runtime already downloaded at {:?}", model_dir);
+        println!("Use --force to re-download");
+        return Ok(());
+    }
+
+    // Show what's missing
+    let missing = downloader.missing_files();
+    if !missing.is_empty() && !force {
+        println!("Missing model files: {:?}", missing);
+    }
+    if !downloader.has_ort_dll() {
+        println!("ONNX Runtime DLL not found, will download v1.22.0");
+    }
+
+    // Download ONNX Runtime first (required for model inference)
+    // This is needed because the system may have an incompatible version (e.g., 1.17.1)
+    println!("Downloading ONNX Runtime 1.22.0 (~50 MB)...\n");
+    downloader.download_onnx_runtime(force).await?;
+
+    // Download models
+    println!("\nDownloading Parakeet TDT models (~630 MB total)...\n");
+    downloader.download_all(force).await?;
+
+    println!("\nDownload complete! You can now run 'memoire audio-index' to transcribe audio.");
+    Ok(())
+}
+
+/// Run all components in orchestrated mode for testing
+#[tokio::main]
+async fn cmd_test_all(
+    config_path: PathBuf,
+    profile: Option<String>,
+    data_dir_override: Option<PathBuf>,
+) -> Result<()> {
+    use colored_logger::Component;
+    use orchestrator::Orchestrator;
+    use test_config::TestConfig;
+
+    // Initialize colored logger for orchestrator
+    colored_logger::init_component_logger(Component::Orchestrator)?;
+
+    // Load configuration
+    let mut config = if config_path.exists() {
+        info!("Loading config from {:?}", config_path);
+        TestConfig::from_file(&config_path)?
+    } else {
+        warn!("Config file not found, using defaults");
+        TestConfig::default()
+    };
+
+    // Apply profile if specified
+    if let Some(profile_name) = profile {
+        info!("Applying profile: {}", profile_name);
+        config = config.apply_profile(&profile_name)?;
+    }
+
+    // Override data directory if provided
+    if let Some(dir) = data_dir_override {
+        config.general.data_dir = Some(dir.to_string_lossy().to_string());
+    }
+
+    // Run orchestrator
+    let orchestrator = Orchestrator::new(config);
+    orchestrator.run().await
 }

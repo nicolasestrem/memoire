@@ -136,3 +136,57 @@ pub struct OcrStats {
     pub processing_rate: i64,
     pub last_updated: Option<DateTime<Utc>>,
 }
+
+/// New audio chunk to insert
+#[derive(Debug, Clone)]
+pub struct NewAudioChunk {
+    pub file_path: String,
+    pub device_name: Option<String>,
+    pub is_input_device: Option<bool>,
+}
+
+/// New audio transcription to insert
+#[derive(Debug, Clone)]
+pub struct NewAudioTranscription {
+    pub audio_chunk_id: i64,
+    pub transcription: String,
+    pub timestamp: DateTime<Utc>,
+    pub speaker_id: Option<i64>,
+    pub start_time: Option<f64>,
+    pub end_time: Option<f64>,
+}
+
+/// Audio indexing statistics
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AudioStats {
+    pub total_chunks: i64,
+    pub chunks_with_transcription: i64,
+    pub pending_chunks: i64,
+    pub processing_rate: i64,
+    pub last_updated: Option<DateTime<Utc>>,
+}
+
+/// Audio chunk with transcription count
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AudioChunkWithTranscription {
+    pub id: i64,
+    pub file_path: String,
+    pub device_name: Option<String>,
+    pub is_input_device: Option<bool>,
+    pub timestamp: DateTime<Utc>,
+    pub transcription_count: i64,
+}
+
+/// Unified search result type
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type")]
+pub enum SearchResult {
+    Ocr {
+        ocr: OcrText,
+        frame: Frame,
+    },
+    Audio {
+        transcription: AudioTranscription,
+        chunk: AudioChunk,
+    },
+}

@@ -8,7 +8,7 @@ use crate::schema::*;
 
 /// Sanitize a user query for FTS5 search
 /// - Trims whitespace
-/// - Escapes special FTS5 characters by wrapping in quotes
+/// - Removes all special FTS5 characters for safe literal search
 /// - Returns error for empty queries
 pub fn sanitize_fts5_query(query: &str) -> Result<String> {
     let trimmed = query.trim();
@@ -17,17 +17,30 @@ pub fn sanitize_fts5_query(query: &str) -> Result<String> {
         anyhow::bail!("Search query cannot be empty");
     }
 
-    // For simple word/phrase search, wrap in quotes to treat as literal
-    // This avoids FTS5 syntax errors from special characters
-    let sanitized = if trimmed.contains('"') {
-        // If already has quotes, escape internal quotes and wrap
-        format!("\"{}\"", trimmed.replace('"', "\"\""))
-    } else {
-        // Simple case: wrap in quotes for literal match
-        format!("\"{}\"", trimmed)
-    };
+    // Remove all FTS5 special characters that could be used for injection
+    // This ensures the query is treated as a literal phrase match
+    let sanitized = trimmed
+        .replace('"', "")  // Double quote - FTS5 phrase marker
+        .replace('*', "")  // Asterisk - prefix matching
+        .replace('(', "")  // Parentheses - grouping
+        .replace(')', "")
+        .replace('{', "")  // Braces - NEAR operator
+        .replace('}', "")
+        .replace('[', "")  // Brackets - column selection
+        .replace(']', "")
+        .replace(':', "")  // Colon - column filter
+        .replace('^', "")  // Caret - initial term boost
+        .replace('+', "")  // Plus - required term (some FTS variants)
+        .replace('-', "")  // Minus - excluded term
+        .replace('|', ""); // Pipe - OR operator (some variants)
 
-    Ok(sanitized)
+    // Verify we still have content after sanitization
+    if sanitized.trim().is_empty() {
+        anyhow::bail!("Search query contains only special characters");
+    }
+
+    // Wrap in quotes for literal matching
+    Ok(format!("\"{}\"", sanitized.trim()))
 }
 
 /// Insert a new video chunk
@@ -231,6 +244,27 @@ pub fn get_frames_without_ocr(conn: &Connection, limit: i64) -> Result<Vec<Frame
 
     let frames = stmt
         .query_map(params![limit], row_to_frame)?
+        .collect::<Result<Vec<_>, _>>()?;
+
+    Ok(frames)
+}
+
+/// Get frames from a specific video chunk that need OCR processing
+pub fn get_frames_for_chunk_without_ocr(
+    conn: &Connection,
+    chunk_id: i64,
+) -> Result<Vec<Frame>> {
+    let mut stmt = conn.prepare(
+        r#"SELECT f.id, f.video_chunk_id, f.offset_index, f.timestamp, f.app_name,
+           f.window_name, f.browser_url, f.focused, f.frame_hash
+           FROM frames f
+           LEFT JOIN ocr_text o ON f.id = o.frame_id
+           WHERE o.id IS NULL AND f.video_chunk_id = ?1
+           ORDER BY f.timestamp ASC"#,
+    )?;
+
+    let frames = stmt
+        .query_map(params![chunk_id], row_to_frame)?
         .collect::<Result<Vec<_>, _>>()?;
 
     Ok(frames)
@@ -671,11 +705,385 @@ fn parse_datetime(row: &Row, idx: usize) -> rusqlite::Result<DateTime<Utc>> {
         ))
 }
 
+// ============================================================================
+// Audio-related query functions (Phase 3)
+// ============================================================================
+
+/// Insert a new audio chunk
+pub fn insert_audio_chunk(conn: &Connection, chunk: &NewAudioChunk) -> Result<i64> {
+    conn.execute(
+        "INSERT INTO audio_chunks (file_path, device_name, is_input_device) VALUES (?1, ?2, ?3)",
+        params![chunk.file_path, chunk.device_name, chunk.is_input_device.map(|b| b as i32)],
+    )?;
+    Ok(conn.last_insert_rowid())
+}
+
+/// Get audio chunk by ID
+pub fn get_audio_chunk(conn: &Connection, id: i64) -> Result<Option<AudioChunk>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, file_path, device_name, is_input_device, timestamp FROM audio_chunks WHERE id = ?1",
+    )?;
+
+    let chunk = stmt.query_row(params![id], |row| {
+        Ok(AudioChunk {
+            id: row.get(0)?,
+            file_path: row.get(1)?,
+            device_name: row.get(2)?,
+            is_input_device: row.get::<_, Option<i32>>(3)?.map(|v| v != 0),
+            timestamp: parse_datetime(row, 4)?,
+        })
+    });
+
+    match chunk {
+        Ok(c) => Ok(Some(c)),
+        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// Get audio chunks without transcription (for batch processing)
+pub fn get_audio_chunks_without_transcription(conn: &Connection, limit: i64) -> Result<Vec<AudioChunk>> {
+    let mut stmt = conn.prepare(
+        r#"SELECT ac.id, ac.file_path, ac.device_name, ac.is_input_device, ac.timestamp
+           FROM audio_chunks ac
+           LEFT JOIN audio_transcriptions at ON ac.id = at.audio_chunk_id
+           WHERE at.id IS NULL
+           ORDER BY ac.timestamp ASC
+           LIMIT ?1"#,
+    )?;
+
+    let chunks = stmt
+        .query_map(params![limit], |row| {
+            Ok(AudioChunk {
+                id: row.get(0)?,
+                file_path: row.get(1)?,
+                device_name: row.get(2)?,
+                is_input_device: row.get::<_, Option<i32>>(3)?.map(|v| v != 0),
+                timestamp: parse_datetime(row, 4)?,
+            })
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+
+    Ok(chunks)
+}
+
+/// Get total audio chunk count
+pub fn get_audio_chunk_count(conn: &Connection) -> Result<i64> {
+    let count: i64 = conn.query_row("SELECT COUNT(*) FROM audio_chunks", [], |row| row.get(0))?;
+    Ok(count)
+}
+
+/// Insert audio transcription
+pub fn insert_audio_transcription(conn: &Connection, transcription: &NewAudioTranscription) -> Result<i64> {
+    conn.execute(
+        r#"INSERT INTO audio_transcriptions
+           (audio_chunk_id, transcription, timestamp, speaker_id, start_time, end_time)
+           VALUES (?1, ?2, ?3, ?4, ?5, ?6)"#,
+        params![
+            transcription.audio_chunk_id,
+            transcription.transcription,
+            transcription.timestamp.to_rfc3339(),
+            transcription.speaker_id,
+            transcription.start_time,
+            transcription.end_time,
+        ],
+    )?;
+    Ok(conn.last_insert_rowid())
+}
+
+/// Get transcription by audio chunk ID
+pub fn get_transcription_by_chunk(conn: &Connection, chunk_id: i64) -> Result<Option<AudioTranscription>> {
+    let mut stmt = conn.prepare(
+        r#"SELECT id, audio_chunk_id, transcription, timestamp, speaker_id, start_time, end_time
+           FROM audio_transcriptions WHERE audio_chunk_id = ?1"#,
+    )?;
+
+    let transcription = stmt.query_row(params![chunk_id], |row| {
+        Ok(AudioTranscription {
+            id: row.get(0)?,
+            audio_chunk_id: row.get(1)?,
+            transcription: row.get(2)?,
+            timestamp: parse_datetime(row, 3)?,
+            speaker_id: row.get(4)?,
+            start_time: row.get(5)?,
+            end_time: row.get(6)?,
+        })
+    });
+
+    match transcription {
+        Ok(t) => Ok(Some(t)),
+        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// Get all transcriptions for an audio chunk (ordered by start_time)
+pub fn get_transcriptions_by_chunk(conn: &Connection, chunk_id: i64) -> Result<Vec<AudioTranscription>> {
+    let mut stmt = conn.prepare(
+        r#"SELECT id, audio_chunk_id, transcription, timestamp, speaker_id, start_time, end_time
+           FROM audio_transcriptions
+           WHERE audio_chunk_id = ?1
+           ORDER BY start_time ASC NULLS LAST"#,
+    )?;
+
+    let transcriptions = stmt
+        .query_map(params![chunk_id], |row| {
+            Ok(AudioTranscription {
+                id: row.get(0)?,
+                audio_chunk_id: row.get(1)?,
+                transcription: row.get(2)?,
+                timestamp: parse_datetime(row, 3)?,
+                speaker_id: row.get(4)?,
+                start_time: row.get(5)?,
+                end_time: row.get(6)?,
+            })
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+
+    Ok(transcriptions)
+}
+
+/// Get total count of audio chunks
+pub fn get_total_audio_chunk_count(conn: &Connection, device: Option<&str>) -> Result<i64> {
+    let count: i64 = if let Some(dev) = device {
+        conn.query_row(
+            "SELECT COUNT(*) FROM audio_chunks WHERE device_name = ?1",
+            params![dev],
+            |row| row.get(0),
+        )?
+    } else {
+        conn.query_row("SELECT COUNT(*) FROM audio_chunks", [], |row| row.get(0))?
+    };
+    Ok(count)
+}
+
+/// Get count of chunks with transcription
+pub fn get_transcription_count(conn: &Connection) -> Result<i64> {
+    let count: i64 = conn.query_row(
+        "SELECT COUNT(DISTINCT audio_chunk_id) FROM audio_transcriptions",
+        [],
+        |row| row.get(0),
+    )?;
+    Ok(count)
+}
+
+/// Full-text search on audio transcriptions
+pub fn search_transcriptions(
+    conn: &Connection,
+    query: &str,
+    limit: i64,
+    offset: i64,
+) -> Result<Vec<(AudioTranscription, AudioChunk)>> {
+    let mut stmt = conn.prepare(
+        r#"SELECT at.id, at.audio_chunk_id, at.transcription, at.timestamp,
+           at.speaker_id, at.start_time, at.end_time,
+           ac.id, ac.file_path, ac.device_name, ac.is_input_device, ac.timestamp
+           FROM audio_transcriptions at
+           JOIN audio_fts fts ON at.id = fts.rowid
+           JOIN audio_chunks ac ON at.audio_chunk_id = ac.id
+           WHERE audio_fts MATCH ?1
+           ORDER BY rank
+           LIMIT ?2 OFFSET ?3"#,
+    )?;
+
+    let results = stmt
+        .query_map(params![query, limit, offset], |row| {
+            let transcription = AudioTranscription {
+                id: row.get(0)?,
+                audio_chunk_id: row.get(1)?,
+                transcription: row.get(2)?,
+                timestamp: parse_datetime(row, 3)?,
+                speaker_id: row.get(4)?,
+                start_time: row.get(5)?,
+                end_time: row.get(6)?,
+            };
+            let chunk = AudioChunk {
+                id: row.get(7)?,
+                file_path: row.get(8)?,
+                device_name: row.get(9)?,
+                is_input_device: row.get::<_, Option<i32>>(10)?.map(|v| v != 0),
+                timestamp: parse_datetime(row, 11)?,
+            };
+            Ok((transcription, chunk))
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+
+    Ok(results)
+}
+
+/// Unified search across OCR and transcriptions
+pub fn search_all(
+    conn: &Connection,
+    query: &str,
+    limit: i64,
+    offset: i64,
+) -> Result<Vec<SearchResult>> {
+    let mut results = Vec::new();
+
+    // Search OCR with full limit first
+    let ocr_results = search_ocr(conn, query, limit, 0)?;
+    for (ocr, frame) in ocr_results {
+        results.push(SearchResult::Ocr { ocr, frame });
+    }
+
+    // Search audio with remaining limit
+    let remaining_limit = limit.saturating_sub(results.len() as i64);
+    if remaining_limit > 0 {
+        let audio_results = search_transcriptions(conn, query, remaining_limit, 0)?;
+        for (transcription, chunk) in audio_results {
+            results.push(SearchResult::Audio { transcription, chunk });
+        }
+    }
+
+    // Sort by timestamp (newest first) and apply pagination
+    // Note: This is a simple implementation. For production, use UNION in SQL
+    results.sort_by(|a, b| {
+        let ts_a = match a {
+            SearchResult::Ocr { frame, .. } => frame.timestamp,
+            SearchResult::Audio { transcription, .. } => transcription.timestamp,
+        };
+        let ts_b = match b {
+            SearchResult::Ocr { frame, .. } => frame.timestamp,
+            SearchResult::Audio { transcription, .. } => transcription.timestamp,
+        };
+        ts_b.cmp(&ts_a)
+    });
+
+    // Apply offset and limit
+    let start = offset as usize;
+    let end = (offset + limit) as usize;
+    let paginated: Vec<_> = results.into_iter().skip(start).take(end - start).collect();
+
+    Ok(paginated)
+}
+
+/// Get audio indexing statistics
+pub fn get_audio_stats(conn: &Connection) -> Result<AudioStats> {
+    let total_chunks: i64 = conn.query_row("SELECT COUNT(*) FROM audio_chunks", [], |row| row.get(0))?;
+
+    let chunks_with_transcription: i64 = conn.query_row(
+        "SELECT COUNT(DISTINCT audio_chunk_id) FROM audio_transcriptions",
+        [],
+        |row| row.get(0),
+    )?;
+
+    let pending_chunks = total_chunks - chunks_with_transcription;
+
+    // Calculate processing rate (chunks processed in last hour)
+    let processing_rate: i64 = conn.query_row(
+        r#"SELECT COUNT(DISTINCT at.audio_chunk_id)
+           FROM audio_transcriptions at
+           JOIN audio_chunks ac ON at.audio_chunk_id = ac.id
+           WHERE ac.timestamp >= datetime('now', '-1 hour')"#,
+        [],
+        |row| row.get(0),
+    )?;
+
+    // Get last updated timestamp
+    let last_updated: Option<DateTime<Utc>> = {
+        let result: Result<String, _> = conn.query_row(
+            "SELECT MAX(ac.timestamp) FROM audio_chunks ac JOIN audio_transcriptions at ON ac.id = at.audio_chunk_id",
+            [],
+            |row| row.get(0),
+        );
+
+        result.ok().and_then(|s| {
+            DateTime::parse_from_rfc3339(&s)
+                .map(|dt| dt.with_timezone(&Utc))
+                .ok()
+        })
+    };
+
+    Ok(AudioStats {
+        total_chunks,
+        chunks_with_transcription,
+        pending_chunks,
+        processing_rate,
+        last_updated,
+    })
+}
+
+/// Get paginated audio chunks with optional filters
+pub fn get_audio_chunks_paginated(
+    conn: &Connection,
+    limit: i64,
+    offset: i64,
+    device: Option<&str>,
+    is_input: Option<bool>,
+) -> Result<Vec<AudioChunkWithTranscription>> {
+    let mut query = String::from(
+        r#"SELECT ac.id, ac.file_path, ac.device_name, ac.is_input_device, ac.timestamp,
+           COUNT(at.id) as transcription_count
+           FROM audio_chunks ac
+           LEFT JOIN audio_transcriptions at ON ac.id = at.audio_chunk_id"#,
+    );
+
+    let mut conditions = Vec::new();
+    let mut params: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
+
+    if let Some(dev) = device {
+        conditions.push("ac.device_name = ?");
+        params.push(Box::new(dev.to_string()));
+    }
+
+    if let Some(input) = is_input {
+        conditions.push("ac.is_input_device = ?");
+        params.push(Box::new(input as i32));
+    }
+
+    if !conditions.is_empty() {
+        query.push_str(" WHERE ");
+        query.push_str(&conditions.join(" AND "));
+    }
+
+    query.push_str(" GROUP BY ac.id ORDER BY ac.timestamp DESC LIMIT ? OFFSET ?");
+
+    let mut stmt = conn.prepare(&query)?;
+
+    let mut all_params: Vec<&dyn rusqlite::ToSql> = params.iter().map(|p| p.as_ref()).collect();
+    all_params.push(&limit);
+    all_params.push(&offset);
+
+    let chunks = stmt
+        .query_map(all_params.as_slice(), |row| {
+            Ok(AudioChunkWithTranscription {
+                id: row.get(0)?,
+                file_path: row.get(1)?,
+                device_name: row.get(2)?,
+                is_input_device: row.get::<_, Option<i32>>(3)?.map(|v| v != 0),
+                timestamp: parse_datetime(row, 4)?,
+                transcription_count: row.get(5)?,
+            })
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+
+    Ok(chunks)
+}
+
+/// Get total count of search results for audio
+pub fn get_audio_search_count(conn: &Connection, query: &str) -> Result<i64> {
+    let count: i64 = conn.query_row(
+        r#"SELECT COUNT(*)
+           FROM audio_transcriptions at
+           JOIN audio_fts fts ON at.id = fts.rowid
+           WHERE audio_fts MATCH ?1"#,
+        params![query],
+        |row| row.get(0),
+    )?;
+    Ok(count)
+}
+
 /// Delete all OCR records with empty text (for re-indexing after bug fixes)
-pub fn delete_empty_ocr_records(conn: &Connection) -> Result<usize> {
+pub fn reset_empty_ocr(conn: &Connection) -> Result<usize> {
     let deleted = conn.execute(
         "DELETE FROM ocr_text WHERE text = ''",
         [],
     )?;
+    Ok(deleted)
+}
+
+/// Delete ALL OCR records (for complete re-indexing)
+pub fn reset_all_ocr(conn: &Connection) -> Result<usize> {
+    let deleted = conn.execute("DELETE FROM ocr_text", [])?;
     Ok(deleted)
 }

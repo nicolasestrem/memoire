@@ -14,4 +14,7 @@ chrono.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 
+# Audio encoding
+hound.workspace = true
+
 memoire-db = { path = "../memoire-db" }

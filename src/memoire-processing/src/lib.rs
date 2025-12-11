@@ -1,8 +1,9 @@
-//! memoire-processing - OCR and STT processing for Memoire
+//! memoire-processing - Video and audio processing for Memoire
 //!
-//! Handles text extraction from frames and speech-to-text transcription.
-//! Phase 1: Stub implementation, full OCR in Phase 2.
+//! Handles video encoding and audio chunk management.
 
 pub mod encoder;
+pub mod audio_encoder;
 
 pub use encoder::VideoEncoder;
+pub use audio_encoder::{AudioEncoder, AudioEncoderConfig};

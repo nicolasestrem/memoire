@@ -7,11 +7,13 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::sync::RwLock;
+use tokio::sync::{broadcast, RwLock};
 use tracing::{debug, error, info, warn};
 
 use memoire_db::Database;
 use memoire_ocr::{FrameData, Processor as OcrProcessor};
+
+use crate::recorder::ChunkFinalizedEvent;
 
 /// OCR batch settings
 const OCR_BATCH_SIZE: usize = 30;
@@ -38,6 +40,7 @@ pub struct Indexer {
     running: Arc<AtomicBool>,
     stats: Arc<RwLock<IndexerStats>>,
     processed_count: Arc<AtomicU64>,
+    chunk_events_rx: Option<broadcast::Receiver<ChunkFinalizedEvent>>,
 }
 
 impl Indexer {
@@ -75,10 +78,19 @@ impl Indexer {
             processor,
             data_dir,
             ocr_fps: ocr_fps.unwrap_or(DEFAULT_OCR_FPS),
-            running: Arc::new(AtomicBool::new(false)),
+            running: Arc::new(AtomicBool::new(true)), // Start as running
             stats: Arc::new(RwLock::new(stats)),
             processed_count: Arc::new(AtomicU64::new(0)),
+            chunk_events_rx: None, // Will be set via set_chunk_events_receiver()
         })
+    }
+
+    /// Set the chunk finalization event receiver
+    ///
+    /// This enables event-driven processing for immediate indexing of finalized chunks.
+    pub fn set_chunk_events_receiver(&mut self, rx: broadcast::Receiver<ChunkFinalizedEvent>) {
+        info!("OCR indexer now using event-driven chunk processing");
+        self.chunk_events_rx = Some(rx);
     }
 
     /// Get current statistics
@@ -92,37 +104,90 @@ impl Indexer {
     }
 
     /// Run the indexer (blocks until stopped)
-    pub async fn run(&mut self) -> Result<()> {
+    pub async fn run(&mut self, shutdown: Arc<AtomicBool>) -> Result<()> {
         info!("starting OCR indexer at {} fps", self.ocr_fps);
         self.running.store(true, Ordering::Relaxed);
 
-        let frame_interval = Duration::from_secs_f64(1.0 / self.ocr_fps as f64);
-        let mut last_frame_time = Instant::now();
+        let poll_interval = Duration::from_secs(10); // Poll every 10 seconds as fallback
         let mut batch_start = Instant::now();
         let mut batch_count = 0u64;
 
-        while self.running.load(Ordering::Relaxed) {
-            // Rate limiting
-            let elapsed = last_frame_time.elapsed();
-            if elapsed < frame_interval {
-                tokio::time::sleep(frame_interval - elapsed).await;
-            }
-            last_frame_time = Instant::now();
+        // Take ownership of the receiver if present
+        let mut chunk_rx = self.chunk_events_rx.take();
+        let use_events = chunk_rx.is_some();
 
-            // Process next batch of frames
-            match self.process_batch().await {
-                Ok(count) => {
-                    if count > 0 {
-                        batch_count += count as u64;
-                        debug!("processed {} frames", count);
-                    } else {
-                        // No frames to process, sleep longer
-                        tokio::time::sleep(Duration::from_secs(1)).await;
+        if use_events {
+            info!("OCR indexer using event-driven mode with {} fallback polling",
+                  poll_interval.as_secs());
+        } else {
+            info!("OCR indexer using polling mode every {} seconds",
+                  poll_interval.as_secs());
+        }
+
+        while !shutdown.load(Ordering::SeqCst) && self.running.load(Ordering::Relaxed) {
+            // Event-driven mode: wait for chunk events or timeout
+            if let Some(ref mut rx) = chunk_rx {
+                tokio::select! {
+                    // Branch 1: Chunk finalized event received
+                    event = rx.recv() => {
+                        match event {
+                            Ok(evt) => {
+                                debug!("received chunk finalized event for chunk {}", evt.chunk_id);
+                                // Process this specific chunk immediately
+                                match self.process_chunk_frames(evt.chunk_id).await {
+                                    Ok(count) if count > 0 => {
+                                        batch_count += count as u64;
+                                        info!("processed {} frames from newly finalized chunk {}",
+                                              count, evt.chunk_id);
+                                    }
+                                    Ok(_) => {
+                                        debug!("no frames to process in chunk {}", evt.chunk_id);
+                                    }
+                                    Err(e) => {
+                                        error!("error processing chunk {}: {}", evt.chunk_id, e);
+                                    }
+                                }
+                            }
+                            Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                                warn!("indexer lagged, skipped {} chunk events - processing all pending", skipped);
+                                // Fall through to polling below
+                            }
+                            Err(broadcast::error::RecvError::Closed) => {
+                                warn!("chunk event channel closed, switching to polling mode");
+                                chunk_rx = None; // Switch to polling mode
+                            }
+                        }
+                    }
+
+                    // Branch 2: Timeout - poll for any missed frames (fallback)
+                    _ = tokio::time::sleep(poll_interval) => {
+                        match self.process_batch().await {
+                            Ok(count) if count > 0 => {
+                                batch_count += count as u64;
+                                debug!("processed {} frames via polling fallback", count);
+                            }
+                            Ok(_) => {} // No frames pending
+                            Err(e) => {
+                                error!("polling batch processing error: {}", e);
+                            }
+                        }
                     }
                 }
-                Err(e) => {
-                    error!("batch processing error: {}", e);
-                    tokio::time::sleep(Duration::from_secs(5)).await;
+            } else {
+                // Polling-only mode (no event channel)
+                match self.process_batch().await {
+                    Ok(count) if count > 0 => {
+                        batch_count += count as u64;
+                        debug!("processed {} frames via polling", count);
+                    }
+                    Ok(_) => {
+                        // No frames, sleep before next poll
+                        tokio::time::sleep(poll_interval).await;
+                    }
+                    Err(e) => {
+                        error!("batch processing error: {}", e);
+                        tokio::time::sleep(Duration::from_secs(5)).await;
+                    }
                 }
             }
 
@@ -157,6 +222,24 @@ impl Indexer {
         self.running.store(false, Ordering::Relaxed);
     }
 
+    /// Process frames from a specific chunk (event-driven)
+    async fn process_chunk_frames(&self, chunk_id: i64) -> Result<usize> {
+        // Query frames without OCR for this specific chunk
+        let frames = memoire_db::get_frames_for_chunk_without_ocr(
+            self.db.connection(),
+            chunk_id,
+        )?;
+
+        if frames.is_empty() {
+            return Ok(0);
+        }
+
+        debug!("processing {} frames from chunk {} (event-driven)", frames.len(), chunk_id);
+
+        // Use the same concurrent processing logic as process_batch
+        self.process_frame_list(&frames).await
+    }
+
     /// Process a batch of frames without OCR
     async fn process_batch(&self) -> Result<usize> {
         // Query frames without OCR (limit to batch size)
@@ -170,6 +253,12 @@ impl Indexer {
         }
 
         debug!("processing batch of {} frames concurrently", frames.len());
+
+        self.process_frame_list(&frames).await
+    }
+
+    /// Process a list of frames (shared logic for batch and event-driven processing)
+    async fn process_frame_list(&self, frames: &[memoire_db::Frame]) -> Result<usize> {
 
         // Step 1: Extract all frames concurrently using spawn_blocking
         // This is the expensive I/O-bound FFmpeg operation
