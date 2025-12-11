@@ -8,7 +8,7 @@ use crate::schema::*;
 
 /// Sanitize a user query for FTS5 search
 /// - Trims whitespace
-/// - Escapes special FTS5 characters by wrapping in quotes
+/// - Removes all special FTS5 characters for safe literal search
 /// - Returns error for empty queries
 pub fn sanitize_fts5_query(query: &str) -> Result<String> {
     let trimmed = query.trim();
@@ -17,17 +17,30 @@ pub fn sanitize_fts5_query(query: &str) -> Result<String> {
         anyhow::bail!("Search query cannot be empty");
     }
 
-    // For simple word/phrase search, wrap in quotes to treat as literal
-    // This avoids FTS5 syntax errors from special characters
-    let sanitized = if trimmed.contains('"') {
-        // If already has quotes, escape internal quotes and wrap
-        format!("\"{}\"", trimmed.replace('"', "\"\""))
-    } else {
-        // Simple case: wrap in quotes for literal match
-        format!("\"{}\"", trimmed)
-    };
+    // Remove all FTS5 special characters that could be used for injection
+    // This ensures the query is treated as a literal phrase match
+    let sanitized = trimmed
+        .replace('"', "")  // Double quote - FTS5 phrase marker
+        .replace('*', "")  // Asterisk - prefix matching
+        .replace('(', "")  // Parentheses - grouping
+        .replace(')', "")
+        .replace('{', "")  // Braces - NEAR operator
+        .replace('}', "")
+        .replace('[', "")  // Brackets - column selection
+        .replace(']', "")
+        .replace(':', "")  // Colon - column filter
+        .replace('^', "")  // Caret - initial term boost
+        .replace('+', "")  // Plus - required term (some FTS variants)
+        .replace('-', "")  // Minus - excluded term
+        .replace('|', ""); // Pipe - OR operator (some variants)
 
-    Ok(sanitized)
+    // Verify we still have content after sanitization
+    if sanitized.trim().is_empty() {
+        anyhow::bail!("Search query contains only special characters");
+    }
+
+    // Wrap in quotes for literal matching
+    Ok(format!("\"{}\"", sanitized.trim()))
 }
 
 /// Insert a new video chunk
@@ -907,16 +920,19 @@ pub fn search_all(
 ) -> Result<Vec<SearchResult>> {
     let mut results = Vec::new();
 
-    // Search OCR
-    let ocr_results = search_ocr(conn, query, limit / 2, 0)?;
+    // Search OCR with full limit first
+    let ocr_results = search_ocr(conn, query, limit, 0)?;
     for (ocr, frame) in ocr_results {
         results.push(SearchResult::Ocr { ocr, frame });
     }
 
-    // Search transcriptions
-    let audio_results = search_transcriptions(conn, query, limit / 2, 0)?;
-    for (transcription, chunk) in audio_results {
-        results.push(SearchResult::Audio { transcription, chunk });
+    // Search audio with remaining limit
+    let remaining_limit = limit.saturating_sub(results.len() as i64);
+    if remaining_limit > 0 {
+        let audio_results = search_transcriptions(conn, query, remaining_limit, 0)?;
+        for (transcription, chunk) in audio_results {
+            results.push(SearchResult::Audio { transcription, chunk });
+        }
     }
 
     // Sort by timestamp (newest first) and apply pagination

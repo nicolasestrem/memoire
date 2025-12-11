@@ -251,9 +251,23 @@ impl AudioIndexer {
                 continue;
             }
 
-            // Transcribe the audio file
-            match self.stt_engine.transcribe_file(&audio_path) {
-                Ok(result) => {
+            // Transcribe the audio file (blocking operation - run in thread pool)
+            let audio_path_clone = audio_path.clone();
+            let transcribe_result = tokio::task::spawn_blocking(move || {
+                // Create a temporary STT engine for this thread
+                // Note: We can't share the engine across threads easily
+                let stt_config = SttConfig {
+                    model_dir: memoire_stt::default_model_dir(),
+                    use_gpu: false, // Use CPU for thread pool tasks
+                    language: None,
+                    num_threads: 1,
+                };
+                let engine = SttEngine::new(stt_config)?;
+                engine.transcribe_file(&audio_path_clone)
+            }).await;
+
+            match transcribe_result {
+                Ok(Ok(result)) => {
                     // Insert transcription segments
                     for segment in &result.segments {
                         let new_transcription = memoire_db::NewAudioTranscription {
@@ -298,8 +312,13 @@ impl AudioIndexer {
                         result.processing_time_ms
                     );
                 }
-                Err(e) => {
+                Ok(Err(e)) => {
                     warn!("failed to transcribe chunk {}: {}", chunk.id, e);
+                    // Insert empty transcription to mark as processed
+                    self.insert_empty_transcription(chunk.id)?;
+                }
+                Err(e) => {
+                    warn!("task join error transcribing chunk {}: {}", chunk.id, e);
                     // Insert empty transcription to mark as processed
                     self.insert_empty_transcription(chunk.id)?;
                 }

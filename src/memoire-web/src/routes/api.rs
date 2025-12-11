@@ -354,11 +354,27 @@ pub async fn get_audio_chunks(
     State(state): State<AppState>,
     Query(params): Query<AudioChunksQuery>,
 ) -> Result<Json<AudioChunksResponse>, ApiError> {
+    // Validate device name length (prevent excessive string allocation)
+    if let Some(ref device) = params.device {
+        if device.len() > 255 {
+            return Err(ApiError::BadRequest("device name too long (max 255 chars)".to_string()));
+        }
+    }
+
     let db = state.db.lock()
         .map_err(|_| ApiError::Internal(anyhow::anyhow!("database lock poisoned")))?;
 
+    // Validate and clamp limit to reasonable range
     let limit = params.limit.unwrap_or(50).max(1).min(100);
-    let offset = params.offset.unwrap_or(0).max(0);
+
+    // Validate offset is non-negative
+    let offset = match params.offset {
+        Some(o) if o < 0 => {
+            return Err(ApiError::BadRequest("offset must be non-negative".to_string()));
+        }
+        Some(o) => o,
+        None => 0,
+    };
 
     let chunks = memoire_db::get_audio_chunks_paginated(
         &db,
@@ -444,11 +460,25 @@ pub async fn search_audio(
     State(state): State<AppState>,
     Query(params): Query<AudioSearchQuery>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    // Validate query length (prevent excessive processing)
+    if params.q.len() > 500 {
+        return Err(ApiError::BadRequest("search query too long (max 500 chars)".to_string()));
+    }
+
     let db = state.db.lock()
         .map_err(|_| ApiError::Internal(anyhow::anyhow!("database lock poisoned")))?;
 
+    // Validate and clamp limit to reasonable range
     let limit = params.limit.unwrap_or(50).max(1).min(100);
-    let offset = params.offset.unwrap_or(0).max(0);
+
+    // Validate offset is non-negative
+    let offset = match params.offset {
+        Some(o) if o < 0 => {
+            return Err(ApiError::BadRequest("offset must be non-negative".to_string()));
+        }
+        Some(o) => o,
+        None => 0,
+    };
 
     // Sanitize the search query for FTS5
     let sanitized_query = memoire_db::sanitize_fts5_query(&params.q)

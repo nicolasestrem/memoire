@@ -14,6 +14,9 @@ use std::io::{Read, Seek, SeekFrom};
 /// Maximum chunk size for range requests (10 MB)
 const MAX_CHUNK_SIZE: usize = 10 * 1024 * 1024;
 
+/// Maximum file size to prevent DOS attacks (500 MB)
+const MAX_FILE_SIZE: u64 = 500 * 1024 * 1024;
+
 /// Parse Range header
 fn parse_range_header(range: &str, file_size: u64) -> Option<(u64, u64)> {
     // Parse "bytes=start-end" format
@@ -67,6 +70,14 @@ pub async fn stream_audio(
     // Get file metadata
     let metadata = tokio::fs::metadata(&file_path).await?;
     let file_size = metadata.len();
+
+    // Validate file size to prevent DOS attacks
+    if file_size > MAX_FILE_SIZE {
+        return Err(ApiError::BadRequest(format!(
+            "file too large: {} bytes (max: {} bytes)",
+            file_size, MAX_FILE_SIZE
+        )));
+    }
 
     // Determine content type from file extension
     let content_type = if chunk.file_path.ends_with(".wav") {

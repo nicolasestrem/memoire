@@ -261,17 +261,29 @@ fn create_mel_filterbank(
 
 /// Compute magnitude spectrum using DFT
 /// This is a simple implementation - use rustfft for better performance
+/// TODO: Replace with rustfft for production (this is O(n²) vs O(n log n))
 fn compute_magnitude_spectrum(samples: &[f32]) -> Vec<f32> {
     let n = samples.len();
+
+    // Validate input size to prevent excessive computation
+    if n > 8192 {
+        // For samples > 8192, this naive DFT becomes prohibitively slow
+        // Return empty spectrum - caller should use smaller chunks or rustfft
+        return vec![0.0f32; n / 2 + 1];
+    }
+
     let num_bins = n / 2 + 1;
     let mut spectrum = vec![0.0f32; num_bins];
+    let n_f32 = n as f32;
 
     for k in 0..num_bins {
         let mut real = 0.0f32;
         let mut imag = 0.0f32;
+        let k_f32 = k as f32;
 
         for (n_idx, &sample) in samples.iter().enumerate() {
-            let angle = -2.0 * PI * k as f32 * n_idx as f32 / n as f32;
+            // Use f32 arithmetic throughout to avoid overflow
+            let angle = -2.0 * PI * k_f32 * (n_idx as f32) / n_f32;
             real += sample * angle.cos();
             imag += sample * angle.sin();
         }

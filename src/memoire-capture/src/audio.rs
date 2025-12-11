@@ -215,7 +215,7 @@ impl AudioCapture {
 
     /// Check if capture is running
     pub fn is_running(&self) -> bool {
-        self.running.load(Ordering::Relaxed)
+        self.running.load(Ordering::Acquire)
     }
 
     /// Get the running flag for external control
@@ -225,11 +225,11 @@ impl AudioCapture {
 
     /// Start capturing audio, returning a receiver for audio chunks
     pub fn start(&mut self) -> Result<tokio::sync::mpsc::Receiver<CapturedAudio>> {
-        if self.running.load(Ordering::Relaxed) {
+        if self.running.load(Ordering::Acquire) {
             return Err(anyhow::anyhow!("Capture already running"));
         }
 
-        self.running.store(true, Ordering::Relaxed);
+        self.running.store(true, Ordering::Release);
         let (tx, rx) = tokio::sync::mpsc::channel(16);
 
         let config = self.config.clone();
@@ -250,7 +250,7 @@ impl AudioCapture {
             ) {
                 error!("audio capture error: {}", e);
             }
-            running.store(false, Ordering::Relaxed);
+            running.store(false, Ordering::Release);
             info!("audio capture thread stopped");
         });
 
@@ -260,7 +260,7 @@ impl AudioCapture {
     /// Stop capturing
     pub fn stop(&self) {
         info!("stopping audio capture");
-        self.running.store(false, Ordering::Relaxed);
+        self.running.store(false, Ordering::Release);
     }
 
     fn capture_loop(
@@ -339,7 +339,7 @@ impl AudioCapture {
         let mut chunk_start_time = Utc::now();
         let mut raw_buffer: VecDeque<u8> = VecDeque::new();
 
-        while running.load(Ordering::Relaxed) {
+        while running.load(Ordering::Acquire) {
             // Wait for audio data
             if use_polling {
                 // Polling mode: sleep for a short duration
@@ -402,6 +402,9 @@ impl AudioCapture {
                     break;
                 }
 
+                // Clear raw buffer to prevent memory leak from unconsumed bytes
+                raw_buffer.clear();
+
                 info!("captured audio chunk: {} seconds", config.chunk_duration_secs);
                 chunk_start_time = Utc::now();
             }
@@ -442,11 +445,12 @@ fn bytes_to_f32(data: &[u8], bits_per_sample: u16, sample_type: &Option<SampleTy
                 .collect()
         }
         (24, _) => {
-            // 24-bit int
+            // 24-bit int (sign-extended to 32-bit)
             data.chunks_exact(3)
                 .map(|chunk| {
-                    let sample = i32::from_le_bytes([chunk[0], chunk[1], chunk[2], 0]) >> 8;
-                    sample as f32 / (1 << 23) as f32
+                    // Build 32-bit value and sign-extend from bit 23
+                    let sample = (i32::from_le_bytes([chunk[0], chunk[1], chunk[2], 0]) << 8) >> 8;
+                    sample as f32 / 8388608.0  // 2^23
                 })
                 .collect()
         }
